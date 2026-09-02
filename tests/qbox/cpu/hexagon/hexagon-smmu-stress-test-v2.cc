@@ -832,7 +832,7 @@ public:
         write_smmu_register(smr0_addr, smr0_value);
 
         uint32_t s2cr0_addr = SMMU_REG_ADDR + SMMU_S2CR_BASE_OFFSET;
-        uint32_t s2cr0_value = (0x1 << 16) | (0 << 0); // TYPE=1, CBNDX=0
+        uint32_t s2cr0_value = (0x0 << 16) | (0 << 0); // TYPE=0 (Translation), CBNDX=0
         write_smmu_register(s2cr0_addr, s2cr0_value);
 
         SCP_INFO(()) << "SMR[0]/S2CR[0]: StreamID=0 -> CB0 (SHARED identity for ALL CPUs)";
@@ -847,7 +847,7 @@ public:
             write_smmu_register(smr_addr, smr_value);
 
             uint32_t s2cr_addr = SMMU_REG_ADDR + SMMU_S2CR_BASE_OFFSET + (high_va_stream_id * 4);
-            uint32_t s2cr_value = (0x1 << 16) | (high_va_cb << 0); // TYPE=1, CBNDX=cb
+            uint32_t s2cr_value = (0x0 << 16) | (high_va_cb << 0); // TYPE=0 (Translation), CBNDX=cb
             write_smmu_register(s2cr_addr, s2cr_value);
 
             SCP_INFO(()) << "SMR[" << high_va_stream_id << "]/S2CR[" << high_va_stream_id

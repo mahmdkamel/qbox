@@ -13,6 +13,7 @@
 #include <mutex>
 #include <limits>
 #include <cassert>
+#include <cstdint>
 #include <memory>
 
 #include <tlm>
@@ -92,13 +93,23 @@ public:
         {
             uint64_t start = info.get_start_address();
             uint64_t end = info.get_end_address();
-            assert(start < end);
+            assert(start <= end);
             assert(!((start == 0) && (end == std::numeric_limits<uint64_t>::max())));
             return end - start + 1;
         }
 
     public:
         DmiRegion() = default;
+
+        static bool valid_info(const tlm::tlm_dmi& info)
+        {
+            const uint64_t start = info.get_start_address();
+            const uint64_t end = info.get_end_address();
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(info.get_dmi_ptr());
+            if (ptr == 0 || end < start || (start == 0 && end == std::numeric_limits<uint64_t>::max())) return false;
+            const uint64_t size = end - start + 1;
+            return size - 1 <= std::numeric_limits<uintptr_t>::max() - ptr;
+        }
 
         DmiRegion(const tlm::tlm_dmi& info, int priority, qemu::LibQemu& inst, int fd = -1)
             : m_ptr(info.get_dmi_ptr())
@@ -231,6 +242,11 @@ public:
      */
     void get_region(const tlm::tlm_dmi& info, int fd = -1)
     {
+        if (!DmiRegion::valid_info(info)) {
+            SCP_WARN("DMI.Libqbox") << "Ignoring invalid DMI region pointer 0x" << std::hex
+                                     << reinterpret_cast<uintptr_t>(info.get_dmi_ptr());
+            return;
+        }
         DmiRegion::Key start = DmiRegion::key_from_tlm_dmi(info);
         uint64_t size = (info.get_end_address() - info.get_start_address()) + 1;
 
@@ -282,6 +298,11 @@ public:
      */
     DmiRegionAlias::Ptr get_new_region_alias(const tlm::tlm_dmi& info, int fd = -1)
     {
+        if (!DmiRegion::valid_info(info)) {
+            SCP_WARN("DMI.Libqbox") << "Rejecting invalid DMI alias pointer 0x" << std::hex
+                                     << reinterpret_cast<uintptr_t>(info.get_dmi_ptr());
+            return {};
+        }
         get_region(info, fd);
         return std::make_shared<DmiRegionAlias>(m_root, info, m_inst);
     }

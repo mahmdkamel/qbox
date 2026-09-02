@@ -10,6 +10,7 @@
 #define LIBQBOX_QEMU_INSTANCE_H_
 
 #include <cassert>
+#include <mutex>
 #include <sstream>
 #include <systemc>
 
