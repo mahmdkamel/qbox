@@ -342,6 +342,10 @@ private:
                 // Configure SMMU mapping for this CPU to this region
                 configure_smmu_mapping(cpu_id, region);
 
+                // Do not allow the CPU to start filling until the page-table
+                // and context-bank updates above have completed.
+                cpu.status = READY;
+
                 SCP_INFO((TEST)) << "CPU_" << cpu_id << " assigned region " << region << " for filling";
             } else {
                 cpu.status = BUSY; // No regions available
@@ -358,6 +362,10 @@ private:
 
                 // Configure SMMU mapping for this CPU to this region
                 configure_smmu_mapping(cpu_id, region);
+
+                // Do not allow the CPU to start checking until the mapping is
+                // fully installed.
+                cpu.status = READY;
 
                 SCP_INFO((TEST)) << "CPU_" << cpu_id << " assigned region " << region << " for checking";
             } else {
@@ -1328,15 +1336,7 @@ void CpuHexagonSMMUStressTestV2::reconfigure_context_bank(uint32_t cb, uint64_t 
 void SMMUTesterController::configure_smmu_mapping(uint32_t cpu_id, uint32_t region_id)
 {
     if (m_parent) {
-        // Run map_cpu_to_region in a separate thread
-        std::thread mapping_thread([this, cpu_id, region_id]() {
-            CPUState& cpu = m_cpu_states[cpu_id];
-            m_parent->map_cpu_to_region(cpu_id, region_id);
-            cpu.status = READY;
-        });
-
-        // Detach the thread to allow it to run independently
-        mapping_thread.detach();
+        m_parent->map_cpu_to_region(cpu_id, region_id);
     }
 }
 

@@ -6,6 +6,7 @@
  */
 #include <systemc>
 
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 #include <deque>
@@ -36,6 +37,7 @@ public:
     static constexpr int DMI_WRITES_PER_RESET = 10; // DMI writes before reset (reduced for ARM immediate)
     static constexpr int NUM_RESETS = 3;            // Number of resets to perform
     static constexpr int RESET_TRIGGER_VAL = 7;     // Special value to trigger reset (very small)
+    static constexpr uint32_t FAILURE_VAL = UINT32_MAX;
 
     // Firmware is loaded from binary file instead of embedded string
 
@@ -44,6 +46,7 @@ private:
     reset_gpio reset_controller;
     std::thread m_thread;
     gs::async_event reset_event;
+    MultiInitiatorSignalSocket<bool> m_cpu_halts;
 
     int m_reset_count = 0;
     int m_cpu0_iterations = 0;
@@ -52,7 +55,9 @@ private:
 
 public:
     CpuArmCortexA53DmiResetTest(const sc_core::sc_module_name& n)
-        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmi>(n), reset_controller("reset", &m_inst_a)
+        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmi>(n)
+        , reset_controller("reset", &m_inst_a)
+        , m_cpu_halts("cpu_halt")
     {
         char buf[2048];
         SCP_DEBUG(SCMOD) << "CpuArmCortexA53DmiResetTest constructor";
@@ -64,6 +69,9 @@ public:
         }
 
         reset.bind(reset_controller.reset_in);
+        for (auto& cpu : m_cpus) {
+            m_cpu_halts.bind(cpu.halt);
+        }
 
         SC_METHOD(reset_method);
         sensitive << reset_event;
@@ -85,7 +93,7 @@ private:
 
     virtual void mmio_write(int id, uint64_t addr, uint64_t data, size_t len) override
     {
-        int cpuid = (addr >= CpuTesterDmi::MMIO_ADDR) ? ((addr - CpuTesterDmi::MMIO_ADDR) >> 3) : 0;
+        int cpuid = addr >> 3;
 
         if (id != CpuTesterDmi::SOCKET_MMIO) {
             SCP_INFO(SCMOD) << "cpu_" << cpuid << " DMI write data: " << std::hex << data << ", len: " << len;
@@ -96,7 +104,7 @@ private:
         SCP_INFO(SCMOD) << "Total MMIO writes so far: " << (++m_cpu0_iterations);
 
         // Check for failure indication
-        if (data == 9) { // Small failure indicator value
+        if (data == FAILURE_VAL) {
             SCP_FATAL(SCMOD) << "CPU " << cpuid << " reported test failure!";
             TEST_ASSERT(false);
         }
@@ -104,6 +112,21 @@ private:
         std::lock_guard<std::mutex> lock(m_state_mutex);
 
         if (cpuid == 0 && data == RESET_TRIGGER_VAL) { // Only CPU #0 can trigger resets
+            /*
+             * The next trigger is an acknowledgement that the preceding
+             * reset completed and the CPU resumed DMI traffic. Do not stop
+             * while the final reset or its DMI invalidation is still pending.
+             */
+            if (m_reset_count == NUM_RESETS) {
+                SCP_INFO(SCMOD) << "All " << NUM_RESETS << " resets completed - test success!";
+                m_test_completed = true;
+                // Let the final MMIO transaction return before halting the
+                // CPUs, then finish through normal QK starvation.
+                m_cpu_halts.async_write_vector({ true });
+                reset_event.async_detach_suspending();
+                return;
+            }
+
             m_reset_count++;
             SCP_INFO(SCMOD) << "CPU #0 triggering reset #" << m_reset_count;
 
@@ -112,21 +135,12 @@ private:
 
             // Trigger reset
             reset_event.notify();
-
-            // Check if we've completed all resets
-            if (m_reset_count >= NUM_RESETS) {
-                SCP_INFO(SCMOD) << "All " << NUM_RESETS << " resets completed - test success!";
-                m_test_completed = true;
-                // Safer completion for SINGLE threading mode - let monitor thread handle stopping
-                // reset_event.async_detach_suspending();
-                // sc_core::sc_stop();
-            }
         }
     }
 
     virtual uint64_t mmio_read(int id, uint64_t addr, size_t len) override
     {
-        int cpuid = (addr >= CpuTesterDmi::MMIO_ADDR) ? ((addr - CpuTesterDmi::MMIO_ADDR) >> 3) : 0;
+        int cpuid = addr >> 3;
 
         if (id != CpuTesterDmi::SOCKET_MMIO) {
             SCP_INFO(SCMOD) << "cpu_" << cpuid << " DMI read len: " << len;
@@ -138,7 +152,7 @@ private:
 
     virtual bool dmi_request(int id, uint64_t addr, size_t len, tlm::tlm_dmi& ret) override
     {
-        int cpuid = (addr >= CpuTesterDmi::MMIO_ADDR) ? ((addr - CpuTesterDmi::MMIO_ADDR) >> 3) : 0;
+        int cpuid = addr >> 3;
         SCP_INFO(SCMOD) << "cpu_" << cpuid << " DMI request at 0x" << std::hex << addr << ", len: " << len;
         return true; // Always grant DMI
     }
@@ -164,9 +178,6 @@ private:
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 if (m_test_completed) {
-                    // Safely stop simulation from monitor thread
-                    // This avoids race conditions with SINGLE threading mode
-                    sc_core::sc_stop();
                     return;
                 }
             }

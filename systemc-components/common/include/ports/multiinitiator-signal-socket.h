@@ -10,7 +10,9 @@
 #define _LIBGSUTILS_PORTS_MULTIINITIATOR_SIGNAL_SOCKET_H
 
 #include <systemc>
+#include <async_event.h>
 #include <scp/report.h>
+#include <mutex>
 #include "sysc/kernel/sc_time.h"
 #include "target-signal-socket.h"
 template <typename T = bool>
@@ -21,12 +23,14 @@ class MultiInitiatorSignalSocket
     SCP_LOGGER();
     std::vector<T> vals;
     bool vals_valid = false;
-    sc_core::sc_event ev;
+    std::mutex vals_mutex;
+    gs::async_event ev;
 
 public:
     MultiInitiatorSignalSocket(const char* name = "MultiInitiatorSignalSocket")
         : sc_core::sc_port<sc_core::sc_signal_inout_if<T>, 0, sc_core::SC_ZERO_OR_MORE_BOUND>(name)
         , sc_core::sc_module(sc_core::sc_module_name((std::string(name) + "_thread").c_str()))
+        , ev(false)
     {
         SCP_DEBUG(())("Constructor");
         SC_THREAD(writer);
@@ -34,12 +38,20 @@ public:
     void writer()
     {
         while (1) {
-            while (vals_valid == false) {
-                wait(ev);
-            }
             std::vector<T> vs;
-            vs.swap(vals);
-            vals_valid = false;
+            {
+                std::lock_guard<std::mutex> lock(vals_mutex);
+                if (vals_valid) {
+                    vs.swap(vals);
+                    vals_valid = false;
+                }
+            }
+
+            if (vs.empty()) {
+                wait(ev);
+                continue;
+            }
+
             for (auto v : vs) {
                 for (int i = 0; i < this->size(); i++) {
                     if (auto t = dynamic_cast<TargetSignalSocketProxy<bool>*>(this->operator[](i))) {
@@ -53,9 +65,12 @@ public:
     }
     void async_write_vector(const std::vector<T>& vs)
     {
-        vals.insert(vals.end(), vs.begin(), vs.end()); // COPY the vector to the end.
-        vals_valid = true;
-        ev.notify();
+        {
+            std::lock_guard<std::mutex> lock(vals_mutex);
+            vals.insert(vals.end(), vs.begin(), vs.end()); // COPY the vector to the end.
+            vals_valid = true;
+        }
+        ev.async_notify();
     }
 };
 

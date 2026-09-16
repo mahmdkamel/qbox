@@ -578,14 +578,15 @@ protected:
              */
             do_direct_access(trans);
         } else {
-            if (!m_inst.g_rec_qemu_io_lock.try_lock() && !is_on_sysc()) {
+            std::unique_lock<std::recursive_mutex> io_lock(m_inst.g_rec_qemu_io_lock, std::try_to_lock);
+            if (!io_lock.owns_lock() && !is_on_sysc()) {
                 /* Allow only a single access, but handle re-entrant code,
                  * while allowing side-effects in SystemC (e.g. calling wait)
                  * [NB re-entrant code caused via memory listeners to
                  * creation of memory regions (due to DMI) in some models]
                  */
                 m_inst.get().unlock_iothread();
-                m_inst.g_rec_qemu_io_lock.lock();
+                io_lock.lock();
                 m_inst.get().lock_iothread();
             }
             reentrancy++;
@@ -600,7 +601,6 @@ protected:
             }
 
             reentrancy--;
-            m_inst.g_rec_qemu_io_lock.unlock();
         }
         m_initiator.initiator_tidy_tlm_payload(trans);
 
@@ -907,11 +907,11 @@ public:
 
         for (auto m : m_mmio_mrs) {
             m.second->m_mapped_te.clear();
-            auto it = m_dmi_aliases.begin();
-            while (it != m_dmi_aliases.end()) {
-                DmiRegionAlias::Ptr r = it->second;
-                it = remove_alias(it);
-            }
+        }
+
+        auto it = m_dmi_aliases.begin();
+        while (it != m_dmi_aliases.end()) {
+            it = remove_alias(it);
         }
     }
 };

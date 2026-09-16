@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
+#include <atomic>
 #include <thread>
 
 #include "async_event.h"
@@ -43,7 +44,7 @@ class CpuHexagonResetGPIOTest : public CpuTestBench<qemu_cpu_hexagon, CpuTesterM
     std::thread m_thread;
     gs::async_event reset_event;
     int reset_count;
-    int reset_done;
+    std::atomic<bool> reset_done;
     int time_elapsed_ms;
 
     void load_reset_firmware(uint32_t trigger_val)
@@ -59,7 +60,7 @@ public:
         , reset_controller("reset", &m_inst_a)
         , hex_gregs("hexagon_globalreg", &m_inst_a)
         , reset_count(0)
-        , reset_done(0)
+        , reset_done(false)
         , time_elapsed_ms(0)
     {
         for (int i = 0; i < m_cpus.size(); i++) {
@@ -118,7 +119,7 @@ public:
              * This confirms that we have been reset with the updated firmware image and ran enough
              * code afterward to get here.  This is the beginning of the end of the test.
              */
-            reset_done = 1;
+            reset_done.store(true, std::memory_order_release);
             break;
         default:
             TEST_ASSERT(false);
@@ -132,7 +133,7 @@ public:
     {
         while (1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (reset_done) {
+            if (reset_done.load(std::memory_order_acquire)) {
                 /*
                  * The detach here allows the system-c to exit.  If we skip
                  * this step sc will just hang.

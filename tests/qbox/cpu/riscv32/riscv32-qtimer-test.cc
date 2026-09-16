@@ -5,6 +5,7 @@
  */
 
 #include <cstdio>
+#include <atomic>
 #include <vector>
 #include <deque>
 #include <fstream>
@@ -72,8 +73,9 @@ class CpuRiscv32TimerIrqTest : public CpuRiscvTestBench<cpu_riscv32, CpuTesterMm
 
     std::thread m_thread;
     gs::async_event reset_event;
-    int timer_interrupt_count;
-    int test_status;
+    sc_core::sc_event m_stop_event;
+    std::atomic<int> timer_interrupt_count;
+    std::atomic<int> test_status;
     int time_elapsed_ms;
 
     /*
@@ -187,6 +189,10 @@ public:
         sensitive << reset_event;
         dont_initialize();
 
+        SC_METHOD(stop_simulation);
+        sensitive << m_stop_event;
+        dont_initialize();
+
         // Load RISC-V 32-bit timer firmware compiled with LLVM tools
         load_firmware_binary(static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR), // MMIO communication address
                              static_cast<uint32_t>(ACLINT_MTIMER_BASE),       // ACLINT MTimer base address
@@ -253,7 +259,7 @@ public:
             if (timer_interrupt_count >= EXPECTED_TIMER_INTERRUPTS) {
                 SCP_INFO(SCMOD) << "Received " << timer_interrupt_count << " timer interrupts, test successful!";
                 test_status = TEST_COMPLETE;
-                sc_core::sc_stop();
+                finish_test();
             }
             break;
 
@@ -261,7 +267,7 @@ public:
             // Test completed successfully (alternative completion path)
             SCP_INFO(SCMOD) << "Timer IRQ test completed successfully, stopping simulation";
             test_status = TEST_COMPLETE;
-            sc_core::sc_stop();
+            finish_test();
             break;
 
         default:
@@ -272,15 +278,20 @@ public:
 
     virtual uint64_t mmio_read(int id, uint64_t addr, size_t len) override { return 0; }
 
+    void finish_test()
+    {
+        // This callback is entered from QEMU.  Stop in the next delta cycle,
+        // once the MMIO transaction has returned to QEMU.
+        m_stop_event.notify(sc_core::SC_ZERO_TIME);
+    }
+
+    void stop_simulation() { sc_core::sc_stop(); }
+
     void timer_pthread()
     {
         while (1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (test_status == TEST_COMPLETE) {
-                /*
-                 * The detach here allows the system-c to exit.
-                 */
-                reset_event.async_detach_suspending();
                 return;
             }
 

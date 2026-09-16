@@ -8,12 +8,16 @@ _start:
     adr x1, dmi_addr
     ldr x1, [x1]        // DMI data address
 
-    // For simplicity, assume this is CPU 0 for now
-    mov x5, #0          // CPU ID = 0
-
-    // No offset needed for CPU 0
-    // x1 = DMI address for CPU 0 (already set)
-    // x2 = MMIO address for CPU 0 (already set)
+    // Derive the linear CPU ID used by the test bench from MPIDR, then
+    // select this CPU's eight-byte DMI and MMIO slots.
+    mrs x5, mpidr_el1
+    and x3, x5, #0xff
+    and x5, x5, #0xff00
+    lsr x5, x5, #5
+    orr x5, x5, x3
+    lsl x0, x5, #3
+    add x1, x1, x0
+    add x2, x2, x0
 
     mov x3, #10         // max iterations per reset (DMI_WRITES_PER_RESET)
     mov x4, #0          // current counter
@@ -54,7 +58,7 @@ end:
     b end
 
 fail:
-    mov x0, #9          // Small failure indicator
+    mov w0, #-1         // Failure indicator outside the normal counter range
     str w0, [x2]        // Write failure indicator (32-bit)
     b end
 
