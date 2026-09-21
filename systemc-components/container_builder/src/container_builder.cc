@@ -6,6 +6,10 @@
 
 #include "container_builder.h"
 
+#include <algorithm>
+#include <map>
+#include <unordered_map>
+
 namespace gs {
 
 container_builder::container_builder(sc_core::sc_module_name _name)
@@ -87,34 +91,94 @@ void container_builder::redirect_socket_params(const std::string& _name)
         SCP_FATAL(()) << "redirect_socket_params: function was called with empty string!";
     }
 
+    using cci_name_value = std::pair<std::string, cci_value>;
+    const std::string container_prefix = _name + ".";
+    std::map<std::string, std::vector<cci_name_value>> alias_params_by_name;
+    std::map<std::string, std::map<std::string, size_t>> alias_param_indices_by_name;
+    std::map<std::string, size_t> alias_params_processed;
+    std::unordered_map<std::string, std::vector<size_t>> bind_param_indices_by_value;
+    std::vector<size_t> compound_bind_param_indices;
+
+    auto cache_alias_param = [&](const cci_name_value& param, const std::string* current_alias = nullptr) {
+        if (param.first.find(container_prefix) != 0) {
+            return;
+        }
+        const std::string relative_name = param.first.substr(container_prefix.length());
+        const size_t dot_pos = relative_name.find('.');
+        if (dot_pos == std::string::npos) {
+            return;
+        }
+        const std::string alias_name = relative_name.substr(0, dot_pos);
+        if (current_alias && alias_name == *current_alias) {
+            return;
+        }
+        if (m_socket_redirects.find(alias_name) == m_socket_redirects.end()) {
+            return;
+        }
+
+        auto& alias_params = alias_params_by_name[alias_name];
+        auto& alias_param_indices = alias_param_indices_by_name[alias_name];
+        const auto [index_it, inserted] = alias_param_indices.emplace(param.first, alias_params.size());
+        if (inserted) {
+            alias_params.emplace_back(param);
+        } else if (!(alias_params[index_it->second].second == param.second)) {
+            alias_params[index_it->second].second = param.second;
+            alias_params_processed[alias_name] = std::min(alias_params_processed[alias_name], index_it->second);
+        }
+    };
+
+    // The broker returns a copied range. Index simple bind values once, then
+    // process matching entries in their original order for every redirect.
+    auto preset_params = m_broker.get_unconsumed_preset_values();
+    bind_param_indices_by_value.reserve(preset_params.size());
+    for (size_t param_index = 0; param_index < preset_params.size(); ++param_index) {
+        const auto& param = preset_params[param_index];
+        if (param.first.find(".bind") != std::string::npos) {
+            if (param.second.is_string()) {
+                std::string bind_path = param.second.get_string();
+                if (bind_path.find(';') == std::string::npos) {
+                    bind_param_indices_by_value[std::move(bind_path)].push_back(param_index);
+                } else {
+                    compound_bind_param_indices.push_back(param_index);
+                }
+            }
+        }
+
+        cache_alias_param(param);
+    }
+
+    bool copied_alias_param = true;
+    while (copied_alias_param) {
+        copied_alias_param = false;
+        for (const auto& redirect : m_socket_redirects) {
+            const std::string& alias_name = redirect.first;
+            const std::string& internal_path = redirect.second;
+
+            std::string alias_prefix = _name + "." + alias_name;
+            std::string internal_prefix = _name + "." + internal_path;
+
+            auto& alias_params = alias_params_by_name[alias_name];
+            auto& param_index = alias_params_processed[alias_name];
+            for (; param_index < alias_params.size(); ++param_index) {
+                std::string alias_param_name = alias_params[param_index].first;
+                cci_value param_value = alias_params[param_index].second;
+
+                std::string suffix = alias_param_name.substr(alias_prefix.length());
+                std::string internal_param_name = internal_prefix + suffix;
+
+                m_broker.set_preset_cci_value(internal_param_name, param_value);
+                cache_alias_param(std::make_pair(internal_param_name, param_value), &alias_name);
+                m_broker.lock_preset_value(alias_param_name);
+                copied_alias_param = true;
+            }
+        }
+    }
+
     for (const auto& redirect : m_socket_redirects) {
         const std::string& alias_name = redirect.first;
         const std::string& internal_path = redirect.second;
-
-        std::string alias_prefix = _name + "." + alias_name;
-        std::string internal_prefix = _name + "." + internal_path;
-
-        auto alias_params = m_broker.get_unconsumed_preset_values(
-            [&alias_prefix](const std::pair<std::string, cci_value>& iv) {
-                return iv.first.find(alias_prefix) == 0 && iv.first.length() > alias_prefix.length();
-            });
-
-        for (const auto& param : alias_params) {
-            std::string alias_param_name = param.first;
-            cci_value param_value = param.second;
-
-            std::string suffix = alias_param_name.substr(alias_prefix.length());
-            std::string internal_param_name = internal_prefix + suffix;
-
-            m_broker.set_preset_cci_value(internal_param_name, param_value);
-            m_broker.lock_preset_value(alias_param_name);
-        }
-
         std::string alias_socket_path = _name + "." + alias_name;
         std::string internal_socket_path = _name + "." + internal_path;
-
-        auto all_bind_params = m_broker.get_unconsumed_preset_values(
-            [](const std::pair<std::string, cci_value>& iv) { return iv.first.find(".bind") != std::string::npos; });
 
         std::string relative_alias_path = alias_socket_path;
         std::string relative_internal_path = internal_socket_path;
@@ -130,22 +194,31 @@ void container_builder::redirect_socket_params(const std::string& _name)
             }
         }
 
-        for (const auto& param : all_bind_params) {
+        std::string search_paths[] = { "&" + alias_socket_path, alias_socket_path, "&" + relative_alias_path,
+                                       relative_alias_path };
+        std::vector<size_t> matching_param_indices = compound_bind_param_indices;
+        for (const auto& search_path : search_paths) {
+            const auto match = bind_param_indices_by_value.find(search_path);
+            if (match != bind_param_indices_by_value.end()) {
+                matching_param_indices.insert(matching_param_indices.end(), match->second.begin(), match->second.end());
+            }
+        }
+        std::sort(matching_param_indices.begin(), matching_param_indices.end());
+        matching_param_indices.erase(
+            std::unique(matching_param_indices.begin(), matching_param_indices.end()), matching_param_indices.end());
+
+        for (const size_t param_index : matching_param_indices) {
+            auto& param = preset_params[param_index];
             std::string param_name = param.first;
             cci_value param_value = param.second;
 
             if (param_value.is_string()) {
                 std::string bind_path = param_value.get_string();
 
-                std::string search_paths[] = { "&" + alias_socket_path, alias_socket_path, "&" + relative_alias_path,
-                                               relative_alias_path };
-
                 bool matched = false;
-                std::string matched_path;
                 for (const auto& search_path : search_paths) {
                     if (bind_path == search_path) {
                         matched = true;
-                        matched_path = search_path;
                         break;
                     }
                 }
@@ -159,6 +232,8 @@ void container_builder::redirect_socket_params(const std::string& _name)
                     }
 
                     m_broker.set_preset_cci_value(param_name, cci_value(new_bind_path));
+                    param.second = cci_value(new_bind_path);
+                    bind_param_indices_by_value[std::move(new_bind_path)].push_back(param_index);
                 } else if (bind_path.find(';') != std::string::npos) {
                     bool replaced = false;
                     std::string new_bind_path = bind_path;
@@ -195,22 +270,23 @@ void container_builder::redirect_socket_params(const std::string& _name)
 
                     if (replaced) {
                         m_broker.set_preset_cci_value(param_name, cci_value(new_bind_path));
+                        param.second = cci_value(new_bind_path);
                     }
                 }
             }
         }
     }
 
-    m_broker.ignore_unconsumed_preset_values([this, &_name](const std::pair<std::string, cci_value>& iv) {
-        for (const auto& redirect : m_socket_redirects) {
-            const std::string& alias_name = redirect.first;
-            std::string alias_prefix = _name + "." + alias_name;
-            if (iv.first.find(alias_prefix) == 0) {
-                return true;
-            }
+    m_broker.ignore_unconsumed_preset_values([this, container_prefix](const std::pair<std::string, cci_value>& iv) {
+        if (iv.first.find(container_prefix) != 0) {
+            return false;
         }
-        return false;
+        const std::string relative_name = iv.first.substr(container_prefix.length());
+        const size_t dot_pos = relative_name.find('.');
+        return dot_pos != std::string::npos &&
+               m_socket_redirects.find(relative_name.substr(0, dot_pos)) != m_socket_redirects.end();
     });
+
 }
 
 std::string container_builder::replace_all(std::string str, const std::string& from, const std::string& to)

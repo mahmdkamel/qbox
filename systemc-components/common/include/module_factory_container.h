@@ -70,6 +70,8 @@ private:
     mutable std::map<std::string, std::set<std::string>>
         m_per_pass_nested_deps_cache; // Per-pass cache: container_name -> deps (cleared each pass)
     mutable std::map<std::string, bool> m_is_container_type_cache; // Cache for is_container_type() results
+    mutable std::map<std::string, std::set<std::string>> m_cci_children_cache;
+    mutable bool m_cci_children_cache_initialized = false;
 
 public:
     SCP_LOGGER(());
@@ -258,7 +260,7 @@ public:
      */
     void name_bind(sc_core::sc_module* m)
     {
-        for (auto param : sc_cci_children(m->name())) {
+        for (const auto& param : get_cci_children(m->name())) {
             /* We should have a param like
              *  foo = &a.baa
              * foo should relate to an object in this model. a.b.bar should relate to an other
@@ -294,6 +296,32 @@ public:
                 do_binding(m, initname, targetname);
             }
         }
+    }
+
+    const std::set<std::string>& get_cci_children(const std::string& object_name) const
+    {
+        if (!m_cci_children_cache_initialized) {
+            const std::string container_prefix = std::string(name()) + ".";
+            for (const auto& value : m_broker.get_unconsumed_preset_values()) {
+                if (value.first.find(container_prefix) != 0) {
+                    continue;
+                }
+
+                const std::string relative_name = value.first.substr(container_prefix.size());
+                const size_t module_end = relative_name.find('.');
+                if (module_end == std::string::npos) {
+                    continue;
+                }
+                const size_t child_end = relative_name.find('.', module_end + 1);
+                const std::string child_name = relative_name.substr(module_end + 1, child_end - module_end - 1);
+                m_cci_children_cache[container_prefix + relative_name.substr(0, module_end)].insert(child_name);
+            }
+            m_cci_children_cache_initialized = true;
+        }
+
+        static const std::set<std::string> no_children;
+        const auto cache_it = m_cci_children_cache.find(object_name);
+        return cache_it == m_cci_children_cache.end() ? no_children : cache_it->second;
     }
 
     /**
@@ -761,62 +789,6 @@ public:
                 m_per_pass_nested_deps_cache.clear();
 
                 std::map<std::string, std::set<std::string>> depends_on_me;
-                std::map<std::string, std::set<std::string>> bind_reverse_index;
-
-                for (const auto& source_mod : todo) {
-                    if (is_container_type(source_mod)) {
-                        continue;
-                    }
-
-                    std::string source_full_path = module_name + "." + source_mod;
-
-                    // Check if source module is a router
-                    std::string source_modtype;
-                    auto source_type_param = m_broker.get_preset_cci_value(source_full_path + ".moduletype");
-                    if (source_type_param.is_string()) {
-                        source_modtype = source_type_param.get_string();
-                    }
-                    bool source_is_router = (source_modtype.find("router") != std::string::npos ||
-                                             source_modtype.find("Router") != std::string::npos);
-
-                    auto mod_params = m_broker.get_unconsumed_preset_values(
-                        [&source_full_path](const std::pair<std::string, cci::cci_value>& iv) {
-                            return iv.first.find(source_full_path + ".") == 0;
-                        });
-
-                    for (const auto& param : mod_params) {
-                        const std::string& param_name = param.first;
-                        const cci::cci_value& param_value = param.second;
-
-                        if (param_name.length() > 5 && param_name.substr(param_name.length() - 5) == ".bind") {
-                            if (param_value.is_string()) {
-                                std::string bind_target = param_value.get_string();
-                                if (bind_target.length() > 0 && bind_target[0] == '&') {
-                                    std::string ref_path = bind_target.substr(1);
-                                    std::string target_mod;
-
-                                    if (ref_path.find(module_name + ".") == 0) {
-                                        target_mod = ref_path.substr(module_name.length() + 1);
-                                    } else {
-                                        target_mod = ref_path;
-                                    }
-
-                                    size_t dot_pos = target_mod.find('.');
-                                    if (dot_pos != std::string::npos) {
-                                        target_mod = target_mod.substr(0, dot_pos);
-                                    }
-
-                                    // Only track bind dependencies for router modules
-                                    if (source_is_router &&
-                                        std::find(todo.begin(), todo.end(), target_mod) != todo.end()) {
-                                        bind_reverse_index[target_mod].insert(source_mod);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 for (const auto& mod : todo) {
                     std::set<std::string> all_deps;
                     cci::cci_value_list mod_args = get_module_args(module_name + "." + mod);
@@ -850,12 +822,6 @@ public:
                         }
                     }
 
-                    auto bind_it = bind_reverse_index.find(mod);
-                    if (bind_it != bind_reverse_index.end()) {
-                        for (const auto& bind_source : bind_it->second) {
-                            depends_on_me[mod].insert(bind_source);
-                        }
-                    }
                 }
 
                 for (auto it = todo.begin(); it != todo.end();) {

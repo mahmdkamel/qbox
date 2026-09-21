@@ -122,12 +122,22 @@ private:
     std::list<std::string> sc_cci_children(sc_core::sc_module_name name)
     {
         std::list<std::string> children;
-        int l = strlen(name) + 1;
-        auto uncon = m_broker.get_unconsumed_preset_values([&name](const std::pair<std::string, cci::cci_value>& iv) {
-            return iv.first.find(std::string(name) + ".") == 0;
-        });
-        for (auto p : uncon) {
-            children.push_back(p.first.substr(l, p.first.find(".", l) - l));
+        const std::string prefix = std::string(name) + ".";
+        const size_t prefix_length = prefix.length();
+        auto& broker = ConfigurableBroker::get_broker_interface(m_broker);
+        if (const auto* configurable_broker = dynamic_cast<const ConfigurableBroker*>(&broker);
+            configurable_broker && configurable_broker->is_global_broker()) {
+            for (const auto& child_name : configurable_broker->get_unconsumed_preset_names_with_prefix(prefix)) {
+                children.push_back(child_name.substr(prefix_length, child_name.find(".", prefix_length) - prefix_length));
+            }
+        } else {
+            auto uncon = m_broker.get_unconsumed_preset_values(
+                [&prefix, prefix_length](const std::pair<std::string, cci::cci_value>& iv) {
+                    return iv.first.compare(0, prefix_length, prefix) == 0;
+                });
+            for (const auto& p : uncon) {
+                children.push_back(p.first.substr(prefix_length, p.first.find(".", prefix_length) - prefix_length));
+            }
         }
         children.sort();
         children.unique();

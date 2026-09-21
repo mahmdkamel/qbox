@@ -132,6 +132,24 @@ TEST_BENCH(ContainerBuilderTestBench, AllTests)
 
     sc_core::sc_object* memory_x = sc_core::sc_find_object("AllTests.platform.container2.memory_x");
     ASSERT_TRUE(memory_x != nullptr) << "container2.memory_x not created from config";
+
+    sc_core::sc_object* memory_z = sc_core::sc_find_object("AllTests.platform.container3.memory_z");
+    ASSERT_TRUE(memory_z != nullptr) << "container3.memory_z not created from chained alias config";
+
+    const std::string chain_address = "AllTests.platform.container3.router.target_socket.address";
+    const std::string chain_size = "AllTests.platform.container3.router.target_socket.size";
+    const std::string chain_bind = "AllTests.platform.chain_bind_probe.bind";
+    ASSERT_TRUE(m_platform->m_broker.has_preset_value(chain_address)) << "chained alias address was not forwarded";
+    ASSERT_TRUE(m_platform->m_broker.has_preset_value(chain_size)) << "chained alias size was not forwarded";
+    ASSERT_EQ(gs::cci_get<uint64_t>(m_platform->m_broker, chain_address), 0x90000000);
+    ASSERT_EQ(gs::cci_get<uint64_t>(m_platform->m_broker, chain_size), 0x1000);
+    ASSERT_EQ(gs::cci_get<std::string>(m_platform->m_broker, chain_bind),
+              "&platform.container3.router.target_socket");
+
+    const std::string fan_in_address = "AllTests.platform.container4.router.target_socket.address";
+    const std::string fan_in_size = "AllTests.platform.container4.router.target_socket.size";
+    ASSERT_EQ(gs::cci_get<uint64_t>(m_platform->m_broker, fan_in_address), 0xB0000000);
+    ASSERT_EQ(gs::cci_get<uint64_t>(m_platform->m_broker, fan_in_size), 0x2000);
 }
 
 int sc_main(int argc, char* argv[])
