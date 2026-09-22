@@ -21,10 +21,14 @@ class CpuHexagonLdStTest : public CpuTestBench<qemu_cpu_hexagon, CpuTesterMmio>
 
 protected:
     gs::async_event m_aev;
+    gs::async_event m_finish_event;
 
 public:
     CpuHexagonLdStTest(const sc_core::sc_module_name& n)
-        : CpuTestBench<qemu_cpu_hexagon, CpuTesterMmio>(n), hex_gregs("hexagon_globalreg", &m_inst_a), m_aev("aev")
+        : CpuTestBench<qemu_cpu_hexagon, CpuTesterMmio>(n)
+        , hex_gregs("hexagon_globalreg", &m_inst_a)
+        , m_aev("aev")
+        , m_finish_event("finish")
     {
         for (int i = 0; i < m_cpus.size(); i++) {
             auto& cpu = m_cpus[i];
@@ -34,6 +38,9 @@ public:
         hex_gregs.p_hexagon_start_addr = MEM_ADDR;
 
         m_aev.async_attach_suspending();
+        SC_METHOD(finish_test);
+        sensitive << m_finish_event;
+        dont_initialize();
         load_firmware_binary(FIRMWARE_BIN_PATH, MEM_ADDR,
                              std::initializer_list<uint32_t>{ static_cast<uint32_t>(CpuTesterMmio::MMIO_ADDR) });
     }
@@ -57,7 +64,13 @@ public:
     {
         SCP_INFO(SCMOD) << "write, data: 0x" << std::hex << data << ", len: 0x" << len;
         passed = (addr == 0 && data == 0x0f0f0f0f && len == sizeof(int32_t));
+        m_finish_event.notify(sc_core::SC_ZERO_TIME);
+    }
+
+    void finish_test()
+    {
         m_aev.async_detach_suspending();
+        m_finish_event.async_detach_suspending();
     }
 
     virtual uint64_t mmio_read(int id, uint64_t addr, size_t len) override { return 0; }

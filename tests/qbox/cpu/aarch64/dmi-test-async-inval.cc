@@ -8,9 +8,12 @@
 
 #include <systemc>
 
+#include <atomic>
 #include <cstdlib>
 #include <thread>
 #include <vector>
+
+#include <libgssync.h>
 
 #include "test/cpu.h"
 #include "test/tester/dmi_soak.h"
@@ -43,11 +46,12 @@ private:
      */
     uint64_t m_num_write_per_cpu;
     std::thread m_thread;
-    bool running = 0;
+    std::atomic<bool> running{ false };
+    gs::runonsysc m_invalidation_on_sysc;
 
 public:
     CpuArmCortexA53DmiAsyncInvalTest(const sc_core::sc_module_name& n)
-        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>(n)
+        : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>(n), m_invalidation_on_sysc("invalidation_on_sysc")
     {
         SCP_DEBUG(SCMOD) << "CpuArmCortexA53DmiAsyncInvalTest constructor";
         m_num_write_per_cpu = NUM_WRITES / (p_num_cpu * 2);
@@ -61,21 +65,26 @@ public:
 
     virtual void start_of_simulation() override
     {
-        running = true;
+        running.store(true, std::memory_order_release);
         m_thread = std::thread([&]() { inval(); });
     }
     void inval()
     {
-        while (running) {
+        while (running.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             uint64_t l = CpuTesterDmiSoak::DMI_SIZE;
             uint64_t s = (std::rand() + 1u) % l;
             l -= s;
             uint64_t e = s + ((std::rand() + 1u) % l);
-            if (running) {
-                SCP_INFO(SCMOD) << "INVALIDATING";
-                m_tester.dmi_invalidate(s, e);
-                SCP_INFO(SCMOD) << "Invalidation done";
+            if (running.load(std::memory_order_acquire)) {
+                // The timer runs on a native thread. TLM socket callbacks must
+                // run on the SystemC thread to avoid racing CPU transactions.
+                m_invalidation_on_sysc.fork_on_systemc([this, s, e] {
+                    if (!running.load(std::memory_order_acquire)) return;
+                    SCP_INFO(SCMOD) << "INVALIDATING";
+                    m_tester.dmi_invalidate(s, e);
+                    SCP_INFO(SCMOD) << "Invalidation done";
+                });
             }
         }
     }
@@ -124,7 +133,7 @@ public:
     virtual void end_of_simulation() override
     {
         CpuArmTestBench<cpu_arm_cortexA53, CpuTesterDmiSoak>::end_of_simulation();
-        running = false;
+        running.store(false, std::memory_order_release);
         m_thread.join();
     }
 };

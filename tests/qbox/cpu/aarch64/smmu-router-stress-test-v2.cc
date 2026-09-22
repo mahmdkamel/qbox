@@ -497,6 +497,7 @@ protected:
     QemuInstance m_inst_b;
     bool ab = false;
     sc_core::sc_vector<cpu_arm_cortexA53> m_cpus;
+    sc_core::sc_vector<sc_core::sc_out<bool>> m_cpu_halts;
 
     // Memory components
     gs::gs_memory<> m_mem;
@@ -604,6 +605,7 @@ public:
                      ab = !ab;
                      return new cpu_arm_cortexA53(n, ab ? m_inst_a : m_inst_b);
                  })
+        , m_cpu_halts("cpu_halt", p_num_cpu)
         , m_mem("mem", MEM_SIZE)
         , m_main_mem("main_mem", MAIN_MEM_SIZE)
         , m_smmu("smmu")
@@ -620,6 +622,10 @@ public:
             cpu.p_mp_affinity = i++;
             cpu.p_has_el3 = false;
             cpu.p_has_el2 = false; // Un-needed and unavailable for HVF/KVM
+            // Do not let firmware reach the tester before configure_test()
+            // has installed the SMMU stream and context-bank mappings.
+            cpu.p_start_powered_off = true;
+            m_cpu_halts[i - 1].bind(cpu.halt);
         }
 
         sc_core::sc_time global_quantum(p_quantum_ns, sc_core::SC_NS);
@@ -748,6 +754,12 @@ public:
 
     void configure_test()
     {
+        // Establish an explicit halt transition.  This is needed by the
+        // coroutine CPU path before its later release below.
+        for (auto& halt : m_cpu_halts) {
+            halt.write(true);
+        }
+
         wait(sc_core::sc_time(100, sc_core::SC_US));
 
         SCP_INFO(()) << "Configuring SMMU for tester-controlled operation";
@@ -813,6 +825,13 @@ public:
         }
 
         SCP_INFO(()) << "SMMU configuration completed - ready for tester control";
+
+        // A Cortex-A53 configured with start-powered-off stays halted until
+        // this line is deasserted.  Releasing the CPUs only after the SMMU is
+        // fully configured makes the first firmware request deterministic.
+        for (auto& halt : m_cpu_halts) {
+            halt.write(false);
+        }
     }
 
     void setup_identity_context_bank(uint32_t cpu)

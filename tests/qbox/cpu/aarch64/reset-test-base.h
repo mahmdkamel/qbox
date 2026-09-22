@@ -10,6 +10,7 @@
 #include <cci_configuration>
 
 #include <cstdio>
+#include <atomic>
 #include <vector>
 
 #include <ports/multiinitiator-signal-socket.h>
@@ -42,7 +43,8 @@ public:
 protected:
     std::vector<int> m_writes;
     MultiInitiatorSignalSocket<bool> reset;
-    int finished = 0;
+    MultiInitiatorSignalSocket<bool> m_cpu_halts;
+    std::atomic<int> finished{ 0 };
     int resets = 0;
     int this_resets = 0;
     int reset_threshold = 0;
@@ -61,6 +63,7 @@ protected:
 public:
     CpuArmCortexA53SimpleResetBase(const sc_core::sc_module_name& n)
         : CpuArmTestBench<cpu_arm_cortexA53, CpuTesterMmio>(n)
+        , m_cpu_halts("cpu_halt")
 #ifdef SYSTEMMODE
         , reset_controller_a("reset_a", m_inst_a)
         , reset_controller_b("reset_b", m_inst_b)
@@ -72,6 +75,7 @@ public:
 #ifndef SYSTEMMODE
             reset.bind(cpu.reset);
 #endif
+            m_cpu_halts.bind(cpu.halt);
         }
 #ifdef SYSTEMMODE
         reset.bind(reset_controller_a.reset_in);
@@ -212,7 +216,7 @@ public:
 
         reset_ev.async_detach_suspending();
         SCP_INFO(SCMOD) << "Done !";
-        sc_stop();
+        m_cpu_halts.async_write_vector({ true });
     }
 
     virtual void end_of_simulation() override

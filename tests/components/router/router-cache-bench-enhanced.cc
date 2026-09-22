@@ -25,7 +25,13 @@ using namespace std::chrono;
 // Configuration
 static const unsigned int NUM_TARGETS = 10000;        // Large number of targets for realistic map lookup overhead
 static const uint64_t TARGET_REGION_SIZE = 0x1000;    // 4KB per target (typical peripheral register size)
+#ifdef NDEBUG
 static const unsigned int NUM_TRANSACTIONS = 1000000; // 1M transactions for statistical significance
+#else
+// Debug builds exercise the same cache modes and access patterns, but are too
+// slow for the full performance workload on CI runners.
+static const unsigned int NUM_TRANSACTIONS = 250000;
+#endif
 static const unsigned int CACHE_SIZE = 16;            // RegionCache size (after fix)
 static const unsigned int THRASHING_SIZE = 32;        // 2x cache size for worst-case test
 

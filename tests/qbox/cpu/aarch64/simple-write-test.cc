@@ -68,8 +68,9 @@ public:
         for (int i = 0; i < p_num_cpu; i++) {
             if (m_writes[i] < NUM_WRITES) return;
         }
+        // Allow the CPUs to return from this callback, execute WFI, and let
+        // their quantum keepers end the simulation through normal starvation.
         m_aev.async_detach_suspending();
-        sc_core::sc_stop();
     }
 
     virtual void end_of_simulation() override

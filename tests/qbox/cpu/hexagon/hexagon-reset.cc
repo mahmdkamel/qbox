@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
  */
 
+#include <atomic>
 #include <thread>
 
 #include "async_event.h"
@@ -42,8 +43,9 @@ class CpuHexagonResetGPIOTest : public CpuTestBench<qemu_cpu_hexagon, CpuTesterM
     hexagon_globalreg hex_gregs;
     std::thread m_thread;
     gs::async_event reset_event;
+    sc_core::sc_event finish_event;
     int reset_count;
-    int reset_done;
+    std::atomic<bool> reset_done;
     int time_elapsed_ms;
 
     void load_reset_firmware(uint32_t trigger_val)
@@ -59,7 +61,7 @@ public:
         , reset_controller("reset", &m_inst_a)
         , hex_gregs("hexagon_globalreg", &m_inst_a)
         , reset_count(0)
-        , reset_done(0)
+        , reset_done(false)
         , time_elapsed_ms(0)
     {
         for (int i = 0; i < m_cpus.size(); i++) {
@@ -73,6 +75,10 @@ public:
 
         SC_METHOD(reset_method);
         sensitive << reset_event;
+        dont_initialize();
+
+        SC_METHOD(finish_method);
+        sensitive << finish_event;
         dont_initialize();
 
         load_reset_firmware(RESET_TRIGGER);
@@ -118,7 +124,10 @@ public:
              * This confirms that we have been reset with the updated firmware image and ran enough
              * code afterward to get here.  This is the beginning of the end of the test.
              */
-            reset_done = 1;
+            reset_done.store(true, std::memory_order_release);
+            // Return from the QEMU MMIO callback before detaching the
+            // SystemC keepalive event during shutdown.
+            finish_event.notify(sc_core::sc_time(1, sc_core::SC_PS));
             break;
         default:
             TEST_ASSERT(false);
@@ -132,12 +141,7 @@ public:
     {
         while (1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (reset_done) {
-                /*
-                 * The detach here allows the system-c to exit.  If we skip
-                 * this step sc will just hang.
-                 */
-                reset_event.async_detach_suspending();
+            if (reset_done.load(std::memory_order_acquire)) {
                 return;
             }
             TEST_ASSERT(time_elapsed_ms++ < TIMEOUT_LIMIT_MS);
@@ -148,6 +152,7 @@ public:
         TEST_ASSERT(reset_count == 1);
         reset.async_write_vector({ 1, 0 });
     }
+    void finish_method() { reset_event.async_detach_suspending(); }
 
     virtual void start_of_simulation() override
     {

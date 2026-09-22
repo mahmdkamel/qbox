@@ -31,6 +31,7 @@
 #include <smmu500.h>
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm-extensions/pathid_extension.h>
+#include <ports/multiinitiator-signal-socket.h>
 #include <pass.h>
 
 /*
@@ -342,6 +343,10 @@ private:
                 // Configure SMMU mapping for this CPU to this region
                 configure_smmu_mapping(cpu_id, region);
 
+                // Do not allow the CPU to start filling until the page-table
+                // and context-bank updates above have completed.
+                cpu.status = READY;
+
                 SCP_INFO((TEST)) << "CPU_" << cpu_id << " assigned region " << region << " for filling";
             } else {
                 cpu.status = BUSY; // No regions available
@@ -358,6 +363,10 @@ private:
 
                 // Configure SMMU mapping for this CPU to this region
                 configure_smmu_mapping(cpu_id, region);
+
+                // Do not allow the CPU to start checking until the mapping is
+                // fully installed.
+                cpu.status = READY;
 
                 SCP_INFO((TEST)) << "CPU_" << cpu_id << " assigned region " << region << " for checking";
             } else {
@@ -524,6 +533,7 @@ protected:
     hexagon_globalreg m_hex_gregs_b;
     bool ab = false;
     sc_core::sc_vector<qemu_cpu_hexagon> m_cpus;
+    MultiInitiatorSignalSocket<bool> m_cpu_halts;
     std::array<std::unique_ptr<hexagon_tlb>, 2> m_tlbs;
 
     // Memory components
@@ -632,6 +642,7 @@ public:
                      ab = !ab;
                      return new qemu_cpu_hexagon(n, ab ? m_inst_a : m_inst_b);
                  })
+        , m_cpu_halts("cpu_halt")
         , m_mem("mem", MEM_SIZE)
         , m_main_mem("main_mem", MAIN_MEM_SIZE)
         , m_smmu("smmu")
@@ -648,6 +659,16 @@ public:
         tlm_quantumkeeper::set_global_quantum(global_quantum);
 
         m_num_regions = std::max(3u, static_cast<uint32_t>(p_num_cpu.get_value() * 3));
+
+        // A powered-off Hexagon CPU cannot be started by its halt GPIO when
+        // TLM-2 coroutine execution has no active QEMU callback yet.  The
+        // multithread policies need the startup gate below to keep firmware
+        // from reaching the tester before its SMMU mappings exist.
+        const bool gate_cpu_startup = m_inst_a.get_tcg_mode() != QemuInstance::TCG_COROUTINE;
+        for (auto& cpu : m_cpus) {
+            cpu.p_start_powered_off = gate_cpu_startup;
+            m_cpu_halts.bind(cpu.halt);
+        }
 
         SCP_INFO(()) << "Creating SMMU Stress Test V2 with " << p_num_cpu.get_value() << " CPUs, " << m_num_regions
                      << " regions";
@@ -880,6 +901,13 @@ public:
         }
 
         SCP_INFO(()) << "SMMU configuration completed - ready for tester control";
+        // configure_test() runs on the SystemC thread.  Releasing the CPUs
+        // synchronously lets the initial halt transition reach QEMU even
+        // when no CPU callback is available to service an async event.
+        for (int i = 0; i < m_cpu_halts.size(); ++i) {
+            m_cpu_halts[i]->write(false);
+        }
+        wait(sc_core::SC_ZERO_TIME);
     }
 
     void setup_identity_context_bank(uint32_t cpu)
@@ -1328,15 +1356,7 @@ void CpuHexagonSMMUStressTestV2::reconfigure_context_bank(uint32_t cb, uint64_t 
 void SMMUTesterController::configure_smmu_mapping(uint32_t cpu_id, uint32_t region_id)
 {
     if (m_parent) {
-        // Run map_cpu_to_region in a separate thread
-        std::thread mapping_thread([this, cpu_id, region_id]() {
-            CPUState& cpu = m_cpu_states[cpu_id];
-            m_parent->map_cpu_to_region(cpu_id, region_id);
-            cpu.status = READY;
-        });
-
-        // Detach the thread to allow it to run independently
-        mapping_thread.detach();
+        m_parent->map_cpu_to_region(cpu_id, region_id);
     }
 }
 
