@@ -907,11 +907,11 @@ public:
 
         for (auto m : m_mmio_mrs) {
             m.second->m_mapped_te.clear();
-            auto it = m_dmi_aliases.begin();
-            while (it != m_dmi_aliases.end()) {
-                DmiRegionAlias::Ptr r = it->second;
-                it = remove_alias(it);
-            }
+        }
+
+        auto it = m_dmi_aliases.begin();
+        while (it != m_dmi_aliases.end()) {
+            it = remove_alias(it);
         }
     }
 };
