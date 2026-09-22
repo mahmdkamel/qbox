@@ -9,6 +9,11 @@ jobs:
       matrix:
         os: [ ubuntu-24.04, ubuntu-22.04 ]
         preset: [ gcc, gcc-debug, clang, clang-debug, clang-lto ]
+        exclude:
+          # Ubuntu 22.04 ships Clang/LLD 14, whose LTO linker cannot resolve
+          # QEMU's static-library symbols. Keep LTO coverage on 24.04.
+          - os: ubuntu-22.04
+            preset: clang-lto
 
     runs-on: "${{ matrix.os }}"
 
