@@ -87,12 +87,13 @@ public:
     void cleanup_receive_thread()
     {
         m_stop_rcv_thread = true;
-        asio::error_code ignored_error;
+        // The receive loops poll the stop flag. Do not close an Asio object
+        // while the receive thread may still be operating on it.
+        if (m_rcv_thread.joinable()) m_rcv_thread.join();
 
+        asio::error_code ignored_error;
         m_asio_socket.close(ignored_error);
         m_acceptor.close(ignored_error);
-
-        if (m_rcv_thread.joinable()) m_rcv_thread.join();
     }
 
     bool set_endpoint()
@@ -282,11 +283,11 @@ public:
     {
         asio::error_code ec;
 
-        while (m_asio_socket.is_open()) {
+        while (!m_stop_rcv_thread && m_asio_socket.is_open()) {
             size_t read_count = m_asio_socket.read_some(asio::buffer(m_buffer), ec);
             switch (ec.value()) {
             case 0: // Success
-                forward_incoming_data(read_count);
+                if (!m_stop_rcv_thread) forward_incoming_data(read_count);
                 break;
             case asio::error::would_block:
                 // Retry reading after a short delay
