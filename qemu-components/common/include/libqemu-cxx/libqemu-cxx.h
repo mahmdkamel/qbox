@@ -744,6 +744,7 @@ public:
 
     void set_soft_stopped(bool stopped);
     void halt(bool halted);
+    void set_pc(uint64_t vaddr);
 
     void reset(bool reset); /* Reset: on true, enter reset, call cpu_pause and cpu_reset
                              * on false exit reset and call cpu_resume */
