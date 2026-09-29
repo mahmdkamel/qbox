@@ -14,6 +14,7 @@
 #include "qemu-instance.h"
 #include "tlm-extensions/qemu-cpu-hint.h"
 #include "tlm-extensions/qemu-mr-hint.h"
+#include "tlm-extensions/qemu-memtx-attrs.h"
 #include <tlm_sockets_buswidth.h>
 
 class TlmTargetToQemuBridge : public tlm::tlm_fw_transport_if<>
@@ -94,6 +95,18 @@ public:
         if (trans.get_command() == tlm::TLM_IGNORE_COMMAND) {
             trans.set_response_status(tlm::TLM_OK_RESPONSE);
             return;
+        }
+
+        if (const auto* qemu_attrs = trans.get_extension<gs::QemuMemTxAttrsTlmExtension>()) {
+            attrs.secure = qemu_attrs->secure;
+            attrs.space = static_cast<uint8_t>(qemu_attrs->space);
+            attrs.user = qemu_attrs->user;
+            attrs.memory = qemu_attrs->memory;
+            attrs.debug = qemu_attrs->debug;
+            attrs.requester_id = qemu_attrs->requester_id;
+            attrs.pid = qemu_attrs->pid;
+            attrs.address_type = qemu_attrs->address_type;
+            attrs.unspecified = qemu_attrs->unspecified;
         }
 
         current_cpu_save = push_current_cpu(trans);
