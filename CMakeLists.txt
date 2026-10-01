@@ -305,6 +305,7 @@ if (NOT WITHOUT_QEMU)
             qemu-components/common/src/libqemu-cxx/target/microblaze.cc
             qemu-components/common/src/libqemu-cxx/target-info.cc
             qemu-components/common/src/dmi_utils.cc
+            qemu-components/common/src/qemu-instance-order.cc
         )
 endif()
 

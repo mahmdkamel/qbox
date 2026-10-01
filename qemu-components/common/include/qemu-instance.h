@@ -10,6 +10,7 @@
 #define LIBQBOX_QEMU_INSTANCE_H_
 
 #include <cassert>
+#include <cstring>
 #include <sstream>
 #include <systemc>
 
@@ -29,6 +30,7 @@
 
 #include "ports/qemu-target-signal-socket.h"
 #include "mcips-plugin.h"
+#include "qemu-instance-order.h"
 
 class QemuDeviceBaseIF
 {
@@ -83,7 +85,7 @@ public:
  * @brief This class encapsulates a libqemu-cxx qemu::LibQemu instance. It
  * handles QEMU parameters and instance initialization.
  */
-class QemuInstance : public sc_core::sc_module
+class QemuInstance : public sc_core::sc_module, private qemu_instance_order::Entry
 {
 private:
     std::shared_ptr<gs::tlm_quantumkeeper_extended> m_first_qk = NULL;
@@ -351,6 +353,9 @@ public:
             m_mcips_plugin->push_plugin_args("libidlinker.so");
 #endif
         }
+
+        /* Last: the destructor, which unregisters, only runs for a fully constructed object */
+        qemu_instance_order::register_instance(this);
     }
 
     QemuInstance(const QemuInstance&) = delete;
@@ -358,6 +363,7 @@ public:
 
     virtual ~QemuInstance()
     {
+        qemu_instance_order::unregister_instance(this);
         m_running = false;
         if (m_mcips_plugin) {
             m_mcips_plugin.reset();
@@ -463,6 +469,8 @@ public:
     {
         assert(!is_inited());
 
+        init_vnc_instance_first();
+
         if (m_tcg_mode == TCG_UNSPECIFIED) {
             SCP_FATAL(()) << "Unknown tcg mode : " << std::string(p_tcg_mode);
         }
@@ -506,6 +514,76 @@ public:
         m_dmi_mgr.init();
     }
 
+private:
+    /*
+     * All the QEMU instances of the process share the GLib process default
+     * main context, on which QEMU implicitly attaches a lot of its sources,
+     * and in particular the ones of the VNC server. libqemu hands that
+     * context to the first instance being initialized, whose main loop then
+     * dispatches those sources under its own BQL. If that is not the instance
+     * running VNC, the VNC callbacks run on another instance's thread,
+     * without the BQL of the instance they belong to.
+     *
+     * Instances are initialized lazily, in an order resulting from the module
+     * construction order. So when the first one is about to be initialized
+     * (all the modules are constructed by then, hence -vnc is known), the
+     * instance with VNC enabled, if any, is initialized first.
+     *
+     * As a consequence, an instance may be initialized before the elaboration
+     * callbacks of its own devices run: QEMU arguments must be pushed from
+     * module constructors only.
+     */
+    void init_vnc_instance_first()
+    {
+        std::vector<qemu_instance_order::Entry*> instances = qemu_instance_order::claim_first_init();
+        qemu_instance_order::Entry* vnc_inst = nullptr;
+
+        for (auto* i : instances) {
+            if (!i->instance_has_vnc()) {
+                continue;
+            }
+            if (vnc_inst) {
+                SCP_FATAL(()) << "VNC is enabled on several QEMU instances ('" << vnc_inst->instance_name() << "' and '"
+                              << i->instance_name() << "): only one instance can own the GLib default main context";
+            }
+            vnc_inst = i;
+        }
+
+        if (vnc_inst && vnc_inst != this) {
+            SCP_INFO(()) << "Initializing the VNC QEMU instance '" << vnc_inst->instance_name()
+                         << "' first, as it owns the GLib default main context";
+            vnc_inst->instance_init_early();
+        }
+    }
+
+    /* VNC enabled with -vnc, however it was passed (vnc module, qemu_args, ...) */
+    bool instance_has_vnc() const override
+    {
+        const std::vector<char*>& args = m_inst.get_qemu_args();
+
+        /*
+         * QEMU treats --opt as -opt. Each -vnc creates its own display, and
+         * "-vnc none" only disables that one.
+         */
+        for (size_t i = 0; i + 1 < args.size(); i++) {
+            if (std::strcmp(args[i], "-vnc") == 0 || std::strcmp(args[i], "--vnc") == 0) {
+                if (std::strcmp(args[++i], "none") != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    const char* instance_name() const override { return name(); }
+    void instance_init_early() override
+    {
+        if (!is_inited()) {
+            init();
+        }
+    }
+
+public:
     /**
      * @brief Returns true if the instance is initialized
      */
