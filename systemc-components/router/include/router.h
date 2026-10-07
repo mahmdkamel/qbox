@@ -19,14 +19,6 @@
 #include <list>          // Required for std::list
 #include <functional>    // Required for std::less
 
-/* Theoretically a DMI request can be failed with no ill effects, and to protect against re-entrant code
- * between a DMI invalidate and a DMI request on separate threads, effectively requiring work to be done
- * on the same thread, we make use of this by 'try_lock'ing and failing the DMI. However this has the
- * negative side effect that up-stream models may not get DMI's when they expect them, which at the very
- * least would be a performance hit.
- * Define this as true if you require protection against re-entrant models.
- */
-#define THREAD_SAFE_REENTRANT false
 #define THREAD_SAFE true
 #if defined(THREAD_SAFE) and THREAD_SAFE
 #include <mutex>
@@ -444,10 +436,6 @@ class router : public sc_core::sc_module, public gs::router_if<BUSWIDTH>
     SCP_LOGGER((DMI), "dmi");
 
 private:
-#if defined(THREAD_SAFE) and THREAD_SAFE
-    /// @brief Mutex for protecting DMI-related operations.
-    std::mutex m_dmi_mutex;
-#endif
     /// @brief Structure to hold DMI information and associated initiators.
     struct dmi_info {
         std::set<int> initiators; ///< @brief Set of initiator IDs holding this DMI.
@@ -765,14 +753,6 @@ private:
         if (!ti) {
             return false;
         }
-#if defined(THREAD_SAFE_REENTRANT) and THREAD_SAFE_REENTRANT
-        if (!m_dmi_mutex.try_lock()) { // if we're busy invalidating, dont grant DMI's
-            return false;
-        }
-#else
-        m_dmi_mutex.lock();
-#endif
-
         if (ti->use_offset) trans.set_address(addr - ti->address);
         SCP_TRACE((D[ti->index]), ti->name) << "calling get_direct_mem_ptr : " << scp::scp_txn_tostring(trans);
         bool status = initiator_socket[ti->index]->get_direct_mem_ptr(trans, dmi_data);
@@ -796,9 +776,6 @@ private:
         }
         SCP_DEBUG(())
         ("Providing DMI (status {:x}) {:x} - {:x}", status, dmi_data.get_start_address(), dmi_data.get_end_address());
-#if defined(THREAD_SAFE) and THREAD_SAFE
-        m_dmi_mutex.unlock();
-#endif
         return status;
     }
 
@@ -818,9 +795,6 @@ private:
             start = id_targets[id]->address + start;
             end = id_targets[id]->address + end;
         }
-#if defined(THREAD_SAFE) and THREAD_SAFE
-        std::lock_guard<std::mutex> lock(m_dmi_mutex);
-#endif
         invalidate_direct_mem_ptr_ts(id, start, end);
     }
 

@@ -106,9 +106,7 @@ void smmu500<BUSWIDTH>::before_end_of_elaboration()
         const auto access = SMMU_CB_TLBIASID.decode_access(txn);
         if (!access || access.indices.size() != 1 || access.indices[0] >= p_num_cb) return;
         uint32_t val = *(uint32_t*)txn.get_data_ptr();
-        for (auto tbu : tbus) tbu->start_invalidates();
         for (auto tbu : tbus) tbu->invalidate(val);
-        for (auto tbu : tbus) tbu->stop_invalidates();
     });
 
     /* TLBIALL post_write - TLB flush all for this CB */
@@ -117,9 +115,7 @@ void smmu500<BUSWIDTH>::before_end_of_elaboration()
         if (!access || access.indices.size() != 1 || access.indices[0] >= p_num_cb) return;
         const unsigned int cb = static_cast<unsigned int>(access.indices[0]);
         SCP_DEBUG(()) << "TLBIALL write for CB" << cb;
-        for (auto tbu : tbus) tbu->start_invalidates();
         for (auto tbu : tbus) tbu->invalidate(cb);
-        for (auto tbu : tbus) tbu->stop_invalidates();
     });
 }
 

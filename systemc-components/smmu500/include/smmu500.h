@@ -21,7 +21,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <mutex>
 #include <vector>
 #include <memory>
 #include <sstream>
@@ -34,15 +33,6 @@
 #define SMMU_MAX_TBU  16
 #define SMMU_VA_WIDTH 32
 #define SMMU_ADDRMASK ((1ULL << 12) - 1)
-
-/* Theoretically a DMI request can be failed with no ill effects, and to protect against re-entrant code
- * between a DMI invalidate and a DMI request on separate threads, effectively requiring work to be done
- * on the same thread, we make use of this by 'try_lock'ing and failing the DMI. However this has the
- * negative side effect that up-stream models my not get DMI's when they expect them, which at the very
- * least would be a performance hit.
- * Define this as true if you require protection against re-entrant models.
- */
-#define THREAD_SAFE_REENTRANT false
 
 namespace gs {
 
@@ -644,7 +634,6 @@ class smmu500_tbu : public sc_core::sc_module
 {
     SCP_LOGGER();
     smmu500<BUSWIDTH>* m_smmu;
-    std::mutex m_dmi_invalidate_lock;
 
     std::pair<uint64_t, uint64_t> dmi_range[SMMU_MAX_CB] = {};
     bool dmi_range_valid[SMMU_MAX_CB] = { false };
@@ -688,15 +677,6 @@ protected:
 
     virtual bool get_direct_mem_ptr(tlm::tlm_generic_payload& txn, tlm::tlm_dmi& dmi_data)
     {
-#if THREAD_SAFE_REENTRANT == true
-        if (!m_dmi_invalidate_lock.try_lock()) {
-            SCP_DEBUG(())("Failed to get lock, DMI will be refused");
-            return false;
-        }
-#else
-        m_dmi_invalidate_lock.lock();
-#endif
-
         MemoryView VIRT;
         MemoryView PHYS;
 
@@ -718,7 +698,6 @@ protected:
                 dmi_data.set_start_address(newstart);
                 dmi_data.set_dmi_ptr(dmi_data.get_dmi_ptr() + (newstart - VIRT.page_start));
             }
-            m_dmi_invalidate_lock.unlock();
             return ret;
         }
 
@@ -731,10 +710,7 @@ protected:
         txn.set_address(PHYS.page_start);
 
         int ret = downstream_socket->get_direct_mem_ptr(txn, dmi_data);
-        if (!ret) {
-            m_dmi_invalidate_lock.unlock();
-            return ret;
-        }
+        if (!ret) return false;
 
         gs::UnderlyingDMITlmExtension* u_dmi;
         txn.get_extension(u_dmi);
@@ -780,7 +756,6 @@ protected:
                      << dmi_data.get_end_address();
 
         txn.set_address(VIRT.address);
-        m_dmi_invalidate_lock.unlock();
         return ret;
     }
 
@@ -806,9 +781,6 @@ public:
         upstream_socket.register_transport_dbg(this, &smmu500_tbu::transport_dbg);
         upstream_socket.register_get_direct_mem_ptr(this, &smmu500_tbu::get_direct_mem_ptr);
     }
-
-    void start_invalidates() { m_dmi_invalidate_lock.lock(); }
-    void stop_invalidates() { m_dmi_invalidate_lock.unlock(); }
 
     void invalidate(uint32_t CB)
     {
