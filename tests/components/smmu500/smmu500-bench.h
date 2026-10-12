@@ -24,13 +24,19 @@
 
 namespace smmu500_test_regs {
 constexpr uint64_t SCR0 = 0x00;
+constexpr uint64_t SCR1 = 0x04;
+constexpr uint64_t SCR2 = 0x08;
+constexpr uint64_t SACR = 0x10;
 constexpr uint64_t NSCR0 = 0x400;
+constexpr uint64_t NSCR2 = 0x408;
+constexpr uint64_t NSACR = 0x410;
 constexpr uint64_t SIDR0 = 0x20;
 constexpr uint64_t SIDR1 = 0x24;
 constexpr uint64_t SIDR2 = 0x28;
 constexpr uint64_t SIDR7 = 0x3c;
 constexpr uint64_t SGFSR = 0x48;
 constexpr uint64_t NSGFSR = 0x448;
+constexpr uint64_t NSTLBGSTATUS = 0x474;
 constexpr uint64_t STLBIALL = 0x60;
 constexpr uint64_t TLBIVMID = 0x64;
 constexpr uint64_t TLBIALLNSNH = 0x68;
@@ -39,20 +45,24 @@ constexpr uint64_t GATS1PR = 0x110;
 constexpr uint64_t GATS1PR_H = 0x114;
 constexpr uint64_t GATS1PW = 0x118;
 constexpr uint64_t GATS1PW_H = 0x11C;
-constexpr uint64_t GATS1UR = 0x120;
-constexpr uint64_t GATS1UR_H = 0x124;
-constexpr uint64_t GATS1UW = 0x128;
-constexpr uint64_t GATS1UW_H = 0x12C;
+constexpr uint64_t GATS1UR = 0x100;
+constexpr uint64_t GATS1UR_H = 0x104;
+constexpr uint64_t GATS1UW = 0x108;
+constexpr uint64_t GATS1UW_H = 0x10C;
 constexpr uint64_t GATS12PR = 0x130;
 constexpr uint64_t GATS12PR_H = 0x134;
 constexpr uint64_t GATS12PW = 0x138;
 constexpr uint64_t GATS12PW_H = 0x13C;
-constexpr uint64_t GATS12UR = 0x140;
-constexpr uint64_t GATS12UR_H = 0x144;
-constexpr uint64_t GATS12UW = 0x148;
-constexpr uint64_t GATS12UW_H = 0x14C;
+constexpr uint64_t GATS12UR = 0x120;
+constexpr uint64_t GATS12UR_H = 0x124;
+constexpr uint64_t GATS12UW = 0x128;
+constexpr uint64_t GATS12UW_H = 0x12C;
 constexpr uint64_t GPAR = 0x180;
 constexpr uint64_t GPAR_H = 0x184;
+constexpr uint64_t NSGATS1UR = 0x500;
+constexpr uint64_t NSGATS1UR_H = 0x504;
+constexpr uint64_t NSGPAR = 0x580;
+constexpr uint64_t TBU_PWR_STATUS = 0x2204;
 constexpr uint32_t ICF = 1u << 0;
 constexpr uint32_t USF = 1u << 1;
 constexpr uint32_t SMCF = 1u << 2;
@@ -73,6 +83,7 @@ constexpr uint32_t GFRE = 1u << 1;
 constexpr uint32_t GFIE = 1u << 2;
 constexpr uint32_t USFCFG = 1u << 10;
 constexpr uint32_t SMCFCFG = 1u << 21;
+constexpr uint32_t GASRAE = 1u << 24;
 constexpr uint32_t S2CR_TRANSLATION = 0;
 constexpr uint32_t S2CR_BYPASS = 1;
 constexpr uint32_t S2CR_FAULT = 2;
@@ -386,6 +397,26 @@ protected:
         sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
         mmio->b_transport(txn, delay);
         txn.clear_extension(&security);
+        return txn.get_response_status();
+    }
+
+    tlm::tlm_response_status mmio_read32_with_security(uint64_t address, bool secure, uint32_t* value_out = nullptr)
+    {
+        uint32_t value = 0;
+        tlm::tlm_generic_payload txn;
+        gs::QemuMemTxSecureTlmExtension security;
+        txn.set_command(tlm::TLM_READ_COMMAND);
+        txn.set_address(address);
+        txn.set_data_ptr(reinterpret_cast<unsigned char*>(&value));
+        txn.set_data_length(sizeof(value));
+        txn.set_streaming_width(sizeof(value));
+        txn.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+        security.value = secure;
+        txn.set_extension(&security);
+        sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
+        mmio->b_transport(txn, delay);
+        txn.clear_extension(&security);
+        if (value_out) *value_out = value;
         return txn.get_response_status();
     }
 

@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <memory>
 #include <sstream>
@@ -148,10 +149,14 @@ private:
     static constexpr uint64_t S2CR_BASE = 0xc00;
     static constexpr uint64_t CBAR_BASE = 0x1000;
     static constexpr uint64_t CBA2R_BASE = 0x1800;
+    static constexpr uint64_t TBU_PWR_STATUS = 0x2204;
 
     std::array<uint32_t, SMMU_MAX_CB> m_cb_fsr_before_write = {};
     uint32_t m_sgfsr_before_write = 0;
     uint32_t m_nsgfsr_before_write = 0;
+
+    std::array<uint8_t, 0x190> m_secure_gr0_shadow = {};
+    std::array<uint8_t, 0x190> m_non_secure_gr0_shadow = {};
 
     std::atomic<uint64_t> m_translation_seq{ 0 };
     /* Page-table/DMI callbacks can re-enter translation on the same
@@ -275,8 +280,8 @@ private:
             attrs.pid = ext->pid;
             attrs.bid = ext->bid;
         }
-        if (const auto* qemu_attrs = txn.get_extension<QemuMemTxSecureTlmExtension>()) {
-            attrs.non_secure = !qemu_attrs->value;
+        if (const auto* secure = txn.get_extension<QemuMemTxSecureTlmExtension>()) {
+            attrs.non_secure = !secure->value;
         }
         return attrs;
     }
@@ -286,43 +291,290 @@ private:
         return address >= start && length <= size && address - start <= size - length;
     }
 
-    bool smmu500_register_access_allowed(const tlm::tlm_generic_payload& txn)
-    {
-        const auto* qemu_attrs = txn.get_extension<QemuMemTxSecureTlmExtension>();
-        if (!qemu_attrs || qemu_attrs->value) return true;
+    enum class RegisterAccessTarget { Model, Shadow, IdRegister, Denied };
 
+    struct RegisterAccess {
+        RegisterAccessTarget target = RegisterAccessTarget::Model;
+        uint64_t address = 0;
+        bool non_secure = false;
+    };
+
+    static bool smmu500_is_secure_only_gr0_register(uint64_t address, uint64_t length)
+    {
+        return smmu500_range_within(address, length, 0x004, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x060, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x0a0, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x0a8, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x0bc, sizeof(uint32_t));
+    }
+
+    static bool smmu500_is_non_secure_alias(uint64_t address, uint64_t length)
+    {
+        return smmu500_range_within(address, length, 0x000, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x008, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x010, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x040, 0x1c) ||
+               smmu500_range_within(address, length, 0x070, 0x08) ||
+               smmu500_range_within(address, length, 0x100, 0x40) ||
+               smmu500_range_within(address, length, 0x180, 0x0c);
+    }
+
+    static bool smmu500_is_banked_gr0_register(uint64_t address, uint64_t length)
+    {
+        return smmu500_range_within(address, length, 0x000, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x008, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x010, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x040, 0x1c) ||
+               smmu500_range_within(address, length, 0x064, 0x18) ||
+               smmu500_range_within(address, length, 0x0b0, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x0b8, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x0c0, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x100, 0x40) ||
+               smmu500_range_within(address, length, 0x180, 0x0c);
+    }
+
+    static bool smmu500_is_modelled_banked_gr0_register(uint64_t address, uint64_t length)
+    {
+        return smmu500_range_within(address, length, 0x000, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x010, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x048, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x064, 0x0c) ||
+               smmu500_range_within(address, length, 0x078, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x0b0, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x0b8, sizeof(uint32_t)) ||
+               smmu500_range_within(address, length, 0x0c0, sizeof(uint64_t)) ||
+               smmu500_range_within(address, length, 0x100, 0x40) ||
+               smmu500_range_within(address, length, 0x180, sizeof(uint64_t));
+    }
+
+    static bool smmu500_is_shadowed_gr0_register(uint64_t address, uint64_t length, bool non_secure)
+    {
+        if (!smmu500_is_banked_gr0_register(address, length)) return false;
+        if (non_secure) return address != 0x000 && address != 0x048;
+        return !smmu500_is_modelled_banked_gr0_register(address, length);
+    }
+
+    RegisterAccess smmu500_resolve_register_access(const tlm::tlm_generic_payload& txn)
+    {
         const uint64_t address = txn.get_address();
         const uint64_t length = std::max<uint64_t>(txn.get_data_length(), 1);
+        RegisterAccess access{ RegisterAccessTarget::Model, address, false };
+        const auto* secure = txn.get_extension<QemuMemTxSecureTlmExtension>();
+        if (!secure) return access;
+
+        const bool non_secure = !secure->value;
+        const uint64_t cb_base = static_cast<uint64_t>(p_num_pages) * SMMU_PAGESIZE;
+        if (non_secure && (static_cast<uint32_t>(SMMU_SCR1) & (1u << 24)) && address < cb_base) {
+            access.target = RegisterAccessTarget::Denied;
+            return access;
+        }
+        const bool alias = smmu500_range_within(address, length, NS_GLOBAL_REG_START,
+                                                 NS_GLOBAL_REG_END - NS_GLOBAL_REG_START);
+        const uint64_t primary = alias ? address - NS_GLOBAL_REG_START : address;
+
+        if (alias) {
+            if (!smmu500_is_non_secure_alias(primary, length)) {
+                access.target = RegisterAccessTarget::Denied;
+            } else if (smmu500_is_shadowed_gr0_register(primary, length, true)) {
+                access = { RegisterAccessTarget::Shadow, primary, true };
+            } else if (primary == 0x000 || primary == 0x048) {
+                access.address = address;
+            } else {
+                access.address = primary;
+            }
+            return access;
+        }
+
+        if (!non_secure) {
+            if (smmu500_is_shadowed_gr0_register(address, length, false)) {
+                access = { RegisterAccessTarget::Shadow, address, false };
+            }
+            return access;
+        }
+
+        if (smmu500_range_within(address, length, 0, NS_GLOBAL_REG_START)) {
+            if (smmu500_is_secure_only_gr0_register(address, length)) {
+                access.target = RegisterAccessTarget::Denied;
+            } else if (address == 0x020 || address == 0x024) {
+                access.target = RegisterAccessTarget::IdRegister;
+            } else if (smmu500_is_shadowed_gr0_register(address, length, true)) {
+                access = { RegisterAccessTarget::Shadow, address, true };
+            } else if (address == 0x000 || address == 0x048) {
+                access.address = address + NS_GLOBAL_REG_START;
+            }
+            return access;
+        }
+
         const uint64_t num_ns_smr = std::min<uint64_t>(static_cast<uint32_t>(SCR1_NSNUMSMRGO), p_num_smr);
         const uint64_t num_ns_cb = std::min<uint64_t>(static_cast<uint32_t>(SCR1_NSNUMCBO), p_num_cb);
-        const uint64_t cb_base = static_cast<uint64_t>(p_num_pages) * SMMU_PAGESIZE;
+        const bool permitted = smmu500_range_within(address, length, SMR_BASE, num_ns_smr * sizeof(uint32_t)) ||
+                               smmu500_range_within(address, length, S2CR_BASE, num_ns_smr * sizeof(uint32_t)) ||
+                               smmu500_range_within(address, length, CBAR_BASE, num_ns_cb * sizeof(uint32_t)) ||
+                               smmu500_range_within(address, length, CBA2R_BASE, num_ns_cb * sizeof(uint32_t)) ||
+                               smmu500_range_within(address, length, TBU_PWR_STATUS, sizeof(uint32_t)) ||
+                               smmu500_range_within(address, length, cb_base, num_ns_cb * SMMU_PAGESIZE);
+        const bool context_access = address >= cb_base;
+        const uint64_t cb = context_access ? (address - cb_base) / SMMU_PAGESIZE : 0;
+        const bool restricted_stage2_cb = context_access && cb < p_num_cb &&
+                                          (static_cast<uint32_t>(SMMU_SCR1) & (1u << 24)) &&
+                                          static_cast<uint32_t>(SMMU_CBAR[cb][CBAR_TYPE]) == 0;
+        if (!permitted || restricted_stage2_cb) access.target = RegisterAccessTarget::Denied;
+        return access;
+    }
 
-        return smmu500_range_within(address, length, NS_GLOBAL_REG_START, NS_GLOBAL_REG_END - NS_GLOBAL_REG_START) ||
-               smmu500_range_within(address, length, SMR_BASE, num_ns_smr * sizeof(uint32_t)) ||
-               smmu500_range_within(address, length, S2CR_BASE, num_ns_smr * sizeof(uint32_t)) ||
-               smmu500_range_within(address, length, CBAR_BASE, num_ns_cb * sizeof(uint32_t)) ||
-               smmu500_range_within(address, length, CBA2R_BASE, num_ns_cb * sizeof(uint32_t)) ||
-               smmu500_range_within(address, length, cb_base, num_ns_cb * SMMU_PAGESIZE);
+    bool smmu500_access_gr0_shadow(const RegisterAccess& access, tlm::tlm_generic_payload& txn)
+    {
+        auto* data = txn.get_data_ptr();
+        const uint64_t length = txn.get_data_length();
+        if (!data || !length || access.address + length > m_secure_gr0_shadow.size()) {
+            txn.set_response_status(tlm::TLM_GENERIC_ERROR_RESPONSE);
+            return false;
+        }
+        auto& state = access.non_secure ? m_non_secure_gr0_shadow : m_secure_gr0_shadow;
+        if (txn.is_read()) {
+            std::memcpy(data, state.data() + access.address, length);
+        } else if (txn.is_write()) {
+            std::memcpy(state.data() + access.address, data, length);
+            if (access.non_secure) smmu500_handle_non_secure_gr0_write(access.address);
+        } else {
+            txn.set_response_status(tlm::TLM_COMMAND_ERROR_RESPONSE);
+            return false;
+        }
+        txn.set_dmi_allowed(false);
+        txn.set_response_status(tlm::TLM_OK_RESPONSE);
+        return true;
+    }
+
+    bool smmu500_access_non_secure_id_register(const RegisterAccess& access, tlm::tlm_generic_payload& txn)
+    {
+        if (txn.get_data_length() != sizeof(uint32_t) || !txn.get_data_ptr()) return false;
+        if (txn.is_write()) {
+            txn.set_dmi_allowed(false);
+            txn.set_response_status(tlm::TLM_OK_RESPONSE);
+            return true;
+        }
+        if (!txn.is_read()) return false;
+        uint32_t value = access.address == 0x020 ? static_cast<uint32_t>(SMMU_SIDR0) : static_cast<uint32_t>(SMMU_SIDR1);
+        const uint32_t count = access.address == 0x020 ? static_cast<uint32_t>(SCR1_NSNUMSMRGO) :
+                                                        static_cast<uint32_t>(SCR1_NSNUMCBO);
+        value = (value & ~0xffu) | count;
+        std::memcpy(txn.get_data_ptr(), &value, sizeof(value));
+        txn.set_dmi_allowed(false);
+        txn.set_response_status(tlm::TLM_OK_RESPONSE);
+        return true;
+    }
+
+    uint32_t smmu500_non_secure_gr0_read32(uint64_t address) const
+    {
+        uint32_t value = 0;
+        std::memcpy(&value, m_non_secure_gr0_shadow.data() + address, sizeof(value));
+        return value;
+    }
+
+    void smmu500_non_secure_gr0_write32(uint64_t address, uint32_t value)
+    {
+        std::memcpy(m_non_secure_gr0_shadow.data() + address, &value, sizeof(value));
+    }
+
+    void smmu500_handle_non_secure_gr0_write(uint64_t address)
+    {
+        const auto gat = [this, address](bool write, bool stage2, bool unprivileged) {
+            const uint64_t value = (static_cast<uint64_t>(smmu500_non_secure_gr0_read32(address)) << 32) |
+                                   smmu500_non_secure_gr0_read32(address - sizeof(uint32_t));
+            smmu500_gat(value, write, stage2, unprivileged, true);
+        };
+
+        switch (address) {
+        case 0x104: gat(false, false, true); return;
+        case 0x10c: gat(true, false, true); return;
+        case 0x114: gat(false, false, false); return;
+        case 0x11c: gat(true, false, false); return;
+        case 0x124: gat(false, true, true); return;
+        case 0x12c: gat(true, true, true); return;
+        case 0x134: gat(false, true, false); return;
+        case 0x13c: gat(true, true, false); return;
+        case 0x064:
+        case 0x0b8:
+            smmu500_invalidate_vmid(smmu500_non_secure_gr0_read32(address) & 0xffu);
+            break;
+        case 0x068:
+        case 0x06c:
+        case 0x078:
+        case 0x0b0:
+        case 0x0b4:
+        case 0x0c0:
+        case 0x0c4:
+            smmu500_invalidate_all();
+            break;
+        default:
+            return;
+        }
+        std::fill(m_non_secure_gr0_shadow.begin() + 0x064, m_non_secure_gr0_shadow.begin() + 0x0c8, 0);
     }
 
     void smmu500_register_b_transport(int, tlm::tlm_generic_payload& txn, sc_core::sc_time& delay)
     {
-        if (!smmu500_register_access_allowed(txn)) {
+        const RegisterAccess access = smmu500_resolve_register_access(txn);
+        if (access.target == RegisterAccessTarget::Denied) {
+            const auto* secure = txn.get_extension<QemuMemTxSecureTlmExtension>();
+            SCP_WARN(()) << std::hex << "SMMU denied "
+                        << (txn.is_read() ? "read" : txn.is_write() ? "write" : "command")
+                        << " at 0x" << txn.get_address() << " length 0x" << txn.get_data_length()
+                        << " from " << (secure && !secure->value ? "non-secure" : "secure")
+                        << " context";
             txn.set_dmi_allowed(false);
             txn.set_response_status(tlm::TLM_ADDRESS_ERROR_RESPONSE);
             return;
         }
+        const auto* secure = txn.get_extension<QemuMemTxSecureTlmExtension>();
+        if (secure && secure->value && txn.get_address() >= NS_GLOBAL_REG_START &&
+            txn.get_address() < NS_GLOBAL_REG_END) {
+            SCP_DEBUG(()) << std::hex << "SMMU secure "
+                         << (txn.is_read() ? "read" : txn.is_write() ? "write" : "command")
+                         << " of non-secure alias at 0x" << txn.get_address() << " length 0x"
+                         << txn.get_data_length();
+        }
+        if (access.target == RegisterAccessTarget::Shadow) {
+            smmu500_access_gr0_shadow(access, txn);
+            return;
+        }
+        if (access.target == RegisterAccessTarget::IdRegister) {
+            if (!smmu500_access_non_secure_id_register(access, txn)) {
+                txn.set_response_status(tlm::TLM_GENERIC_ERROR_RESPONSE);
+            }
+            return;
+        }
+        const uint64_t address = txn.get_address();
+        txn.set_address(access.address);
         m_register_socket->b_transport(txn, delay);
+        txn.set_address(address);
+        txn.set_dmi_allowed(false);
     }
 
     unsigned int smmu500_register_transport_dbg(int, tlm::tlm_generic_payload& txn)
     {
-        return smmu500_register_access_allowed(txn) ? m_register_socket->transport_dbg(txn) : 0;
+        const RegisterAccess access = smmu500_resolve_register_access(txn);
+        if (access.target == RegisterAccessTarget::Denied) return 0;
+        if (access.target == RegisterAccessTarget::Shadow) {
+            return smmu500_access_gr0_shadow(access, txn) ? txn.get_data_length() : 0;
+        }
+        if (access.target == RegisterAccessTarget::IdRegister) {
+            return smmu500_access_non_secure_id_register(access, txn) ? txn.get_data_length() : 0;
+        }
+        const uint64_t address = txn.get_address();
+        txn.set_address(access.address);
+        const unsigned int transferred = m_register_socket->transport_dbg(txn);
+        txn.set_address(address);
+        return transferred;
     }
 
     bool smmu500_register_get_direct_mem_ptr(int, tlm::tlm_generic_payload& txn, tlm::tlm_dmi& dmi_data)
     {
-        return smmu500_register_access_allowed(txn) && m_register_socket->get_direct_mem_ptr(txn, dmi_data);
+        /* Register behavior depends on the transaction security state and
+         * several writes have side effects. A DMI mapping obtained for one
+         * security state must never service a later access in another. */
+        txn.set_dmi_allowed(false);
+        return false;
     }
 
     void smmu500_program_id_registers()
@@ -733,14 +985,14 @@ private:
             txn.set_dmi_allowed(false);
             txn.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
 
-            QemuMemTxSecureTlmExtension qemu_attrs;
-            qemu_attrs.value = !req->non_secure;
-            txn.set_extension(&qemu_attrs);
+            QemuMemTxSecureTlmExtension secure_ext;
+            secure_ext.value = !req->non_secure;
+            txn.set_extension(&secure_ext);
 
             // A TLM delay is relative to the caller, not an absolute timestamp.
             sc_core::sc_time now = sc_core::SC_ZERO_TIME;
             dma_socket->b_transport(txn, now);
-            txn.clear_extension(&qemu_attrs);
+            txn.clear_extension(&secure_ext);
 
             if (txn.get_response_status() != tlm::TLM_OK_RESPONSE) {
                 SCP_INFO(()) << std::hex << "Bad DMA response CB " << cb << " SID 0x" << req->sid
@@ -1005,7 +1257,7 @@ private:
         return smmu500_at64(cb, va, wr, s2, pa, prot, page_size, fault_addr, fault_attrs, trace_id, sid);
     }
 
-    void smmu500_gat(uint64_t v, bool wr, bool s2, bool unprivileged)
+    void smmu500_gat(uint64_t v, bool wr, bool s2, bool unprivileged, bool non_secure = false)
     {
         std::lock_guard<std::recursive_mutex> translation_lock(m_translation_lock);
         uint64_t va = v & ~SMMU_ADDRMASK;
@@ -1015,21 +1267,31 @@ private:
         uint64_t page_size = 12; // log2 default page size: 4 KiB
         FaultAttrs fault_attrs;
         fault_attrs.privileged = !unprivileged;
-        fault_attrs.non_secure = false;
+        fault_attrs.non_secure = non_secure;
         fault_attrs.address_translation = true;
 
         if (cb >= p_num_cb) {
-            smmu500_record_global_fault(1u << 0, false);
-            SMMU_GPAR = 1;
-            SMMU_GPAR_H = 0;
+            smmu500_record_global_fault(1u << 0, non_secure);
+            if (non_secure) {
+                smmu500_non_secure_gr0_write32(0x180, 1);
+                smmu500_non_secure_gr0_write32(0x184, 0);
+            } else {
+                SMMU_GPAR = 1;
+                SMMU_GPAR_H = 0;
+            }
             return;
         }
 
         SCP_INFO(()) << "ATS: va=0x" << std::hex << va << " cb=0x" << cb << " wr=" << wr << " s2=" << s2;
         bool err = smmu500_at(cb, va, wr, s2, &pa, &prot, &page_size, nullptr, fault_attrs);
 
-        SMMU_GPAR = static_cast<uint32_t>(pa | err);
-        SMMU_GPAR_H = static_cast<uint32_t>(pa >> 32);
+        if (non_secure) {
+            smmu500_non_secure_gr0_write32(0x180, static_cast<uint32_t>(pa | err));
+            smmu500_non_secure_gr0_write32(0x184, static_cast<uint32_t>(pa >> 32));
+        } else {
+            SMMU_GPAR = static_cast<uint32_t>(pa | err);
+            SMMU_GPAR_H = static_cast<uint32_t>(pa >> 32);
+        }
     }
 
 public:
@@ -1105,42 +1367,21 @@ public:
         bool stream_match_conflict = false;
         uint32_t s2cr_type = 0;
         cb = smmu500_stream_id_match(master_id, &stream_match_conflict, &s2cr_type);
+        if (transport_stream_address && (addr >> 36) != 0) {
+            SCP_INFO(()) << std::hex << "SMMU high-VA TBU request id " << trace_id << " address 0x" << addr
+                         << " configured SID 0x" << sid << " effective SID 0x" << master_id << " CSID carrier "
+                         << address_carries_csid << " CB " << cb << " S2CR type " << s2cr_type;
+        }
         bool clientpd = global_control & SCR0_CLIENTPD_MASK;
         if (clientpd) {
             ret.addr_mask = -1;
             return ret;
         }
 
-        const bool trace_dsp_window = va >= SMMU_DSP_WINDOW_START && va < SMMU_DSP_WINDOW_END;
-        if (trace_dsp_window) {
-            SCP_INFO(()) << std::hex << "SMMU translate id " << trace_id << " VA 0x" << va << " base SID 0x" << sid
-                         << " stream bits 0x" << transport_stream_bits << " SID 0x" << master_id << " CB " << cb
-                         << " S2CR type " << s2cr_type;
-        }
         if (cb < 0) {
-            if (trace_dsp_window) {
-                unsigned int valid_count = 0;
-                SCP_DEBUG(()) << std::hex << "DSP stream miss for SID 0x" << master_id << " effective 0x"
-                              << (static_cast<uint32_t>(master_id) & SMMU_STREAM_ID_MASK)
-                              << " (SMR/S2CR dump at TRACE level)";
-                for (unsigned int i = 0; i < std::min<unsigned int>(static_cast<unsigned int>(p_num_smr), SMMU_MAX_SMR);
-                     i++) {
-                    const bool valid = SMMU_SMR[i][SMR_VALID];
-                    if (!valid) continue;
-                    ++valid_count;
-                    SCP_TRACE(()) << std::hex << "  valid SMR[" << i << "] raw_smr 0x"
-                                  << static_cast<uint32_t>(SMMU_SMR[i]) << " id 0x"
-                                  << static_cast<uint32_t>(SMMU_SMR[i][SMR_ID]) << " mask 0x"
-                                  << static_cast<uint32_t>(SMMU_SMR[i][SMR_MASK]) << " raw_s2cr 0x"
-                                  << static_cast<uint32_t>(SMMU_S2CR[i]) << " cb 0x"
-                                  << static_cast<uint32_t>(SMMU_S2CR[i][S2CR_CBNDX_VMID]) << " type 0x"
-                                  << static_cast<uint32_t>(SMMU_S2CR[i][S2CR_TYPE]);
-                }
-                SCP_DEBUG(()) << std::dec << "DSP stream miss valid SMR entries " << valid_count;
-            }
             /* USFCFG selects whether unidentified streams generate a global
              * fault. GFRE selects whether that recorded fault rejects the
-             * transaction or permits a bypass response.  A TBU request with
+             * transaction or permits a bypass response. A TBU request with
              * no transport carrier has no CSID to match; preserve the
              * identity boot traffic instead of turning it into a fault. */
             const bool has_transport_csid = address_carries_csid && ((addr >> 32) & 0xfu) != 0;
@@ -1178,10 +1419,6 @@ public:
          * MULTI status bit is set. Only non-recording probes, such as DMI
          * lookups, suppress fault status updates. */
         err = smmu500_at(cb, va, wr, true, &pa, &prot, &page_size, &fault_addr, fault_attrs, trace_id, master_id);
-        if (trace_dsp_window) {
-            SCP_INFO(()) << std::hex << "SMMU walk CBAR type " << static_cast<uint32_t>(SMMU_CBAR[cb][CBAR_TYPE])
-                         << " err " << err << " PA 0x" << pa << " prot " << prot << " page 0x" << page_size;
-        }
         ret.translated_addr = pa;
         ret.perm = (IOMMUAccessFlags)prot;
         if (err) {
@@ -1267,15 +1504,17 @@ protected:
     {
         sc_dt::uint64 addr = txn.get_address();
         tlm::tlm_command cmd = txn.get_command();
+        const bool high_va = (addr >> 36) != 0;
+        if (high_va) {
+            SCP_INFO(()) << std::hex << "TBU high-VA b_transport address 0x" << addr << " topology ID 0x"
+                         << static_cast<uint32_t>(p_topology_id);
+        }
         typename smmu500<BUSWIDTH>::IOMMUTLBEntry te =
             m_smmu->smmu500_translate(txn, p_topology_id, true);
-        const bool trace_dsp_window = addr >= smmu500<BUSWIDTH>::SMMU_DSP_WINDOW_START &&
-                                      addr < smmu500<BUSWIDTH>::SMMU_DSP_WINDOW_END;
-        if (trace_dsp_window) {
-            SCP_INFO(()) << std::hex << "TBU b_transport VA 0x" << addr << " -> PA 0x" << te.translated_addr
-                         << " mask 0x" << te.addr_mask << " perm " << te.perm;
+        if (high_va) {
+            SCP_INFO(()) << std::hex << "TBU high-VA b_transport result PA 0x" << te.translated_addr << " mask 0x"
+                         << te.addr_mask << " permissions " << te.perm;
         }
-
         if (te.perm == smmu500<BUSWIDTH>::IOMMU_NONE ||
             (cmd == tlm::TLM_WRITE_COMMAND && te.perm == smmu500<BUSWIDTH>::IOMMU_RO) ||
             (cmd == tlm::TLM_READ_COMMAND && te.perm == smmu500<BUSWIDTH>::IOMMU_WO)) {
@@ -1308,18 +1547,21 @@ protected:
         MemoryView PHYS;
 
         VIRT.address = txn.get_address();
-        const bool trace_dsp_window = VIRT.address >= smmu500<BUSWIDTH>::SMMU_DSP_WINDOW_START &&
-                                      VIRT.address < smmu500<BUSWIDTH>::SMMU_DSP_WINDOW_END;
-        if (trace_dsp_window) {
-            SCP_INFO(()) << std::hex << "TBU DMI request VA 0x" << VIRT.address;
+        const bool high_va = (VIRT.address >> 36) != 0;
+        if (high_va) {
+            SCP_INFO(()) << std::hex << "TBU high-VA DMI request address 0x" << VIRT.address << " topology ID 0x"
+                         << static_cast<uint32_t>(p_topology_id);
         }
         typename smmu500<BUSWIDTH>::IOMMUTLBEntry te =
             m_smmu->smmu500_translate(txn, p_topology_id, true, false);
+        if (high_va) {
+            SCP_INFO(()) << std::hex << "TBU high-VA DMI result PA 0x" << te.translated_addr << " mask 0x"
+                         << te.addr_mask << " permissions " << te.perm;
+        }
 
         if (te.perm == smmu500<BUSWIDTH>::IOMMU_NONE) {
-            if (trace_dsp_window) SCP_INFO(()) << "TBU DMI denied by SMMU";
-            const bool address_carries_csid = (VIRT.address >> 36) == 0;
             int CB = -1;
+            const bool address_carries_csid = (VIRT.address >> 36) == 0;
             m_smmu->smmu500_resolve_stream_id(p_topology_id, VIRT.address, &CB, nullptr, nullptr,
                                                address_carries_csid);
             if (CB >= 0 && static_cast<unsigned int>(CB) < SMMU_MAX_CB) {
@@ -1334,8 +1576,6 @@ protected:
             }
             return false;
         }
-
-        SCP_DEBUG(())("te iova {:x} translated_addr {:x} addr_mask {:x}", te.iova, te.translated_addr, te.addr_mask);
 
         if (te.addr_mask == static_cast<uint64_t>(-1)) {
             assert(te.translated_addr == VIRT.address);
@@ -1377,9 +1617,6 @@ protected:
 
         int ret = downstream_socket->get_direct_mem_ptr(txn, dmi_data);
         if (!ret) {
-            if (trace_dsp_window) {
-                SCP_INFO(()) << std::hex << "TBU downstream DMI unavailable for PA 0x" << PHYS.page_start;
-            }
             txn.set_address(VIRT.address);
             return ret;
         }
@@ -1420,8 +1657,8 @@ protected:
             return false;
         }
 
-        const bool address_carries_csid = (VIRT.address >> 36) == 0;
         int CB = -1;
+        const bool address_carries_csid = (VIRT.address >> 36) == 0;
         m_smmu->smmu500_resolve_stream_id(p_topology_id, VIRT.address, &CB, nullptr, nullptr,
                                            address_carries_csid);
         if (CB < 0) {

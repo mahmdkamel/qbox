@@ -20,7 +20,8 @@ ZIP configuration.
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Global config (SCR0, NSCR0, SCR1, SACR) | Functional | SCR0 and NSCR0 independently control secure and non-secure request handling for CLIENTPD, USFCFG, SMCFCFG, GFRE, and GFIE; GCFGFRE/GCFGFIE fields are exposed |
+| Global config (SCR0, NSCR0, SCR1, SACR) | Functional | SCR0 and NSCR0 independently control secure and non-secure request handling. SACR is banked, and NSACR selects its non-secure bank. |
+| Configuration access security | Functional | Normal and debug accesses share a bank resolver. Non-secure accesses to defined NS global aliases are supported for firmware compatibility. `SCR1.GASRAE` blocks non-secure global accesses, including aliases. Register DMI is disabled. |
 | Identification (IDR0-2, IDR7) | Functional | IDR0.NUMSMRG, IDR0.ATOSNS, IDR1.NUMCB, IDR1.NUMPAGENDXB, IDR7 set from CCI params at start_of_simulation |
 | Stream Match (SMR[n]) | Functional | VALID/MASK/ID fields used by smmu500_stream_id_match() |
 | Stream-to-Context (S2CR[n]) | Functional | CBNDX and TYPE are used; translation, bypass, and fault actions are supported |
@@ -32,10 +33,10 @@ ZIP configuration.
 | Global TLB invalidation | Functional | Global invalidate commands trigger conservative DMI invalidation across all TBUs; VMID-targeted commands invalidate CBs whose CBAR.VMID matches |
 | TBU_PWR_STATUS | Stored | Populated from p_num_tbu |
 
-All other registers in the SMMU address space (IDR3-6, PID/CID, global fault
-syndrome, non-secure register copies beyond NSCR0/NSGFSR, performance monitors,
-integration/test, and vendor-specific registers) are accessible as memory via
-the reg_model_maker ZIP configuration but have no behavioral logic.
+The remaining global fault and address-translation status registers preserve
+their secure and non-secure banks but have no additional behavioral logic.
+Other unmodelled address-space registers retain the reg_model_maker default
+behavior.
 
 ### 2.2 Context Bank Registers (per CB page)
 
@@ -184,8 +185,9 @@ The first fault's FAR/IPAFAR and syndrome are preserved when `MULTI` is set.
 
 ### 3.6 Security State Differentiation
 
-`gs::QemuMemTxSecureTlmExtension` carries QEMU `MemTxAttrs` fields for
-QEMU-to-QBox transactions. The SMMU consumes only its security-state field;
+Field-specific `gs::QemuMemTx*TlmExtension` types carry QEMU `MemTxAttrs`
+fields for QEMU-to-QBox transactions. The SMMU consumes only the
+`gs::QemuMemTxSecureTlmExtension` security-state field;
 all other QEMU attributes do not affect SMMU translation or fault reporting.
 `QemuInitiatorSocket` attaches it for QEMU memory accesses. The optional
 `gs::smmu500_transaction_attrs_extension` carries the remaining request
@@ -207,18 +209,20 @@ address-size faults remain independently checked.
 The CPU or interconnect bridge is responsible for attaching request attributes
 at the TBU ingress. For AXI-like request attributes, the intended mapping is:
 
-- `AxPROT[0]` (unprivileged) -> `privileged = false`
-- `AxPROT[1]` (secure) -> `QemuMemTxSecureTlmExtension::secure = true`
+- `AxPROT[0] = 0` (unprivileged) -> `privileged = false`
+- `AxPROT[1] = 0` (secure) -> `QemuMemTxSecureTlmExtension::value = true`
 - instruction/data indication -> `instruction`
 
 Security-tagged register accesses are checked at the SMMU register socket.
-Secure accesses can reach the complete register model. Non-secure accesses are
-restricted to the NS global window, the `SCR1.NSNUMSMRGO`-assigned SMR/S2CR
-slots, and the `SCR1.NSNUMCBO`-assigned CBAR/CBA2R/context-bank resources.
-An unannotated TLM request retains the legacy unrestricted compatibility
-behavior. `smmuv3_memory_attrs_extension` is not a substitute for the SMMU500
-request extension because it carries attributes derived from page-table
-descriptors rather than requester privilege.
+Banked GR0 primary addresses select the caller's security bank; defined aliases in
+`0x400..0x7ff` select the same non-secure bank from either security state.
+Non-secure alias access is supported for firmware compatibility, including
+QNX polling `NSTLBGSTATUS` at `0x474`. Non-secure access
+is also limited by `SCR1.NSNUMSMRGO`, `SCR1.NSNUMCBO`, `SCR1.GASRAE`, and its
+stage-2 context banks when restricted access is enabled.
+An unannotated TLM request retains legacy unrestricted compatibility behavior.
+Register DMI is disabled so cached host pointers cannot bypass bank selection
+or register-write side effects.
 
 ### 3.7 VMID Support
 

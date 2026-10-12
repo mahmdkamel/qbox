@@ -86,9 +86,14 @@ void smmu500<BUSWIDTH>::start_of_simulation()
     sc_assert(p_num_smr <= SMMU_MAX_SMR);
     sc_assert(p_num_cb <= SMMU_MAX_CB);
     smmu500_program_id_registers();
+    SCP_DEBUG(()) << "SMMU register DMI disabled; security-aware MMIO active";
+    m_secure_gr0_shadow.fill(0);
+    m_non_secure_gr0_shadow.fill(0);
+    const uint32_t sacr = static_cast<uint32_t>(SMMU_SACR);
+    std::memcpy(m_non_secure_gr0_shadow.data() + 0x010, &sacr, sizeof(sacr));
     SCR1_NSNUMCBO = static_cast<uint32_t>(p_num_cb);
     SCR1_NSNUMSMRGO = static_cast<uint32_t>(p_num_smr);
-    SCP_INFO(()) << "SMMU configured SMR count " << static_cast<unsigned int>(p_num_smr)
+    SCP_DEBUG(()) << "SMMU configured SMR count " << static_cast<unsigned int>(p_num_smr)
                  << ", SIDR0.NUMSMRG 0x" << std::hex << static_cast<uint32_t>(SIDR0_NUMSMRG);
     SMMU_TBU_PWR_STATUS = (1u << static_cast<uint32_t>(p_num_tbu)) - 1;
     smmu500_update_global_irq();
