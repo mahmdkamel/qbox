@@ -32,7 +32,6 @@ class qemu_cpu_hexagon : public QemuCpu
 public:
     static constexpr qemu::Target ARCH = qemu::Target::HEXAGON;
     sc_core::sc_vector<QemuTargetSignalSocket> irq_in;
-    TargetSignalSocket<bool> start;
 
     qemu_cpu_hexagon(const sc_core::sc_module_name& name, sc_core::sc_object* o1, sc_core::sc_object* o2)
         : qemu_cpu_hexagon(name, *(dynamic_cast<QemuInstance*>(o1)), dynamic_cast<hexagon_globalreg*>(o2))
@@ -55,7 +54,6 @@ public:
         : QemuCpu(name, inst, "v67-hexagon")
         , m_broker(cci::cci_get_broker())
         , irq_in("irq_in", 8, [](const char* n, int i) { return new QemuTargetSignalSocket(n); })
-        , start("start")
         , p_cfgbase("config_table_addr", 0xffffffffULL, "config table address")
         , p_vp_mode("vp_mode", true, "override the vp_mode for testing")
         , p_semihosting("enable_semihosting", false, "enable semihosting for debugging/testing")
@@ -86,16 +84,6 @@ public:
         for (int i = 0; i < irq_in.size(); ++i) {
             m_external_ev |= irq_in[i]->default_event();
         }
-
-        start.register_value_changed_cb([this](const bool& value) {
-            if (!value || !p_hex_greg) return;
-
-            const uint64_t pc = p_hex_greg->p_hexagon_start_addr.get_value();
-            m_inst.get().lock_iothread();
-            m_cpu.set_pc(pc);
-            m_cpu.set_vcpu_dirty(true);
-            m_inst.get().unlock_iothread();
-        });
     }
 
     void set_l2vic(hexagon_l2vic* l2vic) { m_l2vic = l2vic; }
