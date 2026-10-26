@@ -10,6 +10,8 @@
 #define LIBQBOX_DMI_MANAGER_H_
 
 #include <map>
+#include <algorithm>
+#include <iterator>
 #include <mutex>
 #include <limits>
 #include <cassert>
@@ -92,7 +94,7 @@ public:
         {
             uint64_t start = info.get_start_address();
             uint64_t end = info.get_end_address();
-            assert(start < end);
+            assert(start <= end);
             assert(!((start == 0) && (end == std::numeric_limits<uint64_t>::max())));
             return end - start + 1;
         }
@@ -207,11 +209,12 @@ protected:
     /**
      * @brief The DMI manager maintains a "container" memory region as a root
      * where "RAM" memory regions are added to as subregions.
-     * The subregions can overlap using the priority mechanism provided by QEMU.
+     * The subregions cover disjoint host ranges to preserve RAMBlock identity.
      * These "RAM" memory regions are transparent to clients of the DMI manager,
      * and all aliases requested are built upon the root "container" memory region.
      */
     qemu::MemoryRegion m_root;
+    std::shared_ptr<qemu::AddressSpace> m_as;
 
     std::mutex m_mutex;
 
@@ -226,39 +229,35 @@ protected:
 public:
     /**
      * @brief This regions are added as subregions of the manager root memory
-     * region container. They can overlap, hence we use the priority mechanism
-     * provided by QEMU.
+     * region container. Existing host ranges are reused for overlapping grants.
      */
     void get_region(const tlm::tlm_dmi& info, int fd = -1)
     {
         DmiRegion::Key start = DmiRegion::key_from_tlm_dmi(info);
-        uint64_t size = (info.get_end_address() - info.get_start_address()) + 1;
-
-        tlm::tlm_dmi dmi;
-        dmi.set_start_address(info.get_start_address());
-        dmi.set_end_address(info.get_end_address());
-        dmi.set_dmi_ptr(info.get_dmi_ptr());
-
+        const uint64_t size = (info.get_end_address() - info.get_start_address()) + 1;
+        assert(size && size - 1 <= std::numeric_limits<uintptr_t>::max() - start);
+        const uintptr_t end = start + size - 1;
         std::lock_guard<std::mutex> lock(m_mutex);
-
-        auto existing_it = m_regions.find(start);
-        if (existing_it != m_regions.end()) {
-            if (existing_it->second.get_size() != size) {
-                SCP_INFO("DMI.Libqbox")
-                ("Overlapping DMI regions old size {:x} new size {:x}!", existing_it->second.get_size(), size);
-                m_root.del_subregion(existing_it->second.get_mut_mr());
-                m_regions.erase(existing_it);
-            } else {
-                return; // Identical region exists
+        // Preserve each host byte's RAMBlock identity; only map uncovered gaps.
+        for (uintptr_t current = start; current <= end;) {
+            auto next = m_regions.upper_bound(current);
+            if (next != m_regions.begin()) {
+                const auto& previous = std::prev(next)->second;
+                if (current <= previous.get_end()) {
+                    if (previous.get_end() >= end) break;
+                    current = previous.get_end() + 1;
+                    continue;
+                }
             }
-        }
-        DmiRegion region = DmiRegion(dmi, 0, m_inst, fd);
-        m_root.add_subregion(region.get_mut_mr(), region.get_key());
-
-        auto res = m_regions.emplace(region.get_key(), std::move(region));
-        if (!res.second) {
-            DmiRegion& existing_region = res.first->second;
-            SCP_FATAL("DMI.Libqbox") << "Failed to add " << info << " for already existing " << existing_region;
+            const uintptr_t last = next == m_regions.end() ? end : std::min(end, next->first - 1);
+            tlm::tlm_dmi dmi;
+            dmi.set_start_address(info.get_start_address() + (current - start));
+            dmi.set_end_address(info.get_start_address() + (last - start));
+            dmi.set_dmi_ptr(info.get_dmi_ptr() + (current - start));
+            auto inserted = m_regions.try_emplace(current, dmi, 0, m_inst, fd).first;
+            m_root.add_subregion(inserted->second.get_mut_mr(), current);
+            if (last == end) break;
+            current = last + 1;
         }
     }
 
@@ -268,14 +267,18 @@ public:
     QemuInstanceDmiManager(const QemuInstanceDmiManager&) = delete;
     QemuInstanceDmiManager(QemuInstanceDmiManager&& a) = delete;
 
-    ~QemuInstanceDmiManager() { m_root.removeSubRegions(); }
+    ~QemuInstanceDmiManager() { m_root.abandonSubRegions(); }
 
     void init()
     {
         m_root_container = m_inst.object_new_unparented<QemuContainer>();
         m_root = m_inst.object_new_unparented<qemu::MemoryRegion>();
         m_root.init(m_root_container, "dmi-manager", std::numeric_limits<uint64_t>::max());
+        m_as = m_inst.address_space_new();
+        m_as->init(m_root, "dmi-manager");
     }
+
+    qemu::AddressSpace& get_address_space() { return *m_as; }
 
     /**
      * @brief Create a new alias for the DMI region designated by `info`

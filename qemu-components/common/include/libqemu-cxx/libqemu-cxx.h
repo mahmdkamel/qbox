@@ -416,6 +416,9 @@ public:
 
     ~MemoryRegion();
     void removeSubRegions();
+    // Drop wrapper bookkeeping without issuing QEMU memory transactions.
+    // Used only while the owning QEMU instance is being torn down.
+    void abandonSubRegions();
 
     uint64_t get_size();
     int get_priority() const { return m_priority; }

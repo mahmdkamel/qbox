@@ -858,6 +858,35 @@ TEST_BENCH(smmu500_multi_tbu_test_bench, NestedStage1Stage2Translation)
     ASSERT_EQ(read_memory32(0x8234), 0xA5A5A5A5u);
 }
 
+TEST_BENCH(smmu500_multi_tbu_test_bench, NestedTranslationRemapsTablesAndFinalIpa)
+{
+    configure_nested_identity_context();
+    constexpr uint64_t s2_flags = 0x3 | (1ULL << 6) | (1ULL << 7) | (1ULL << 10);
+    write_memory64(0x201020, 0x14000 | s2_flags);
+    write_memory64(0x201028, 0x15000 | s2_flags);
+    write_memory64(0x201030, 0x16000 | s2_flags);
+    write_memory64(0x201040, 0x18000 | s2_flags);
+
+    // Stage-1 descriptors contain IPAs, even though their storage is remapped.
+    write_memory64(0x14000, 0x5000 | 0x3);
+    write_memory64(0x15000, 0x6000 | 0x3);
+    write_memory64(0x16008, 0x8000 | 0x3 | (1ULL << 6) | (1ULL << 10));
+    write_memory64(0x4000, 0);
+    write_memory64(0x5000, 0);
+    write_memory64(0x6008, 0);
+
+    ASSERT_EQ(tbu_write32(0x1234, 0xA5A5A5A5), tlm::TLM_OK_RESPONSE);
+    ASSERT_EQ(read_memory32(0x18234), 0xA5A5A5A5u);
+    ASSERT_EQ(read_memory32(0x8234), 0u);
+    tlm::tlm_dmi dmi;
+    ASSERT_TRUE(tbu_get_dmi(0x1234, dmi));
+    ASSERT_EQ(dmi.get_start_address(), 0x1000u);
+    ASSERT_EQ(dmi.get_end_address(), 0x1fffu);
+    uint32_t value;
+    std::memcpy(&value, dmi.get_dmi_ptr() + 0x234, sizeof(value));
+    ASSERT_EQ(value, 0xA5A5A5A5u);
+}
+
 TEST_BENCH(smmu500_multi_tbu_test_bench, NestedTranslationIntersectsPermissions)
 {
     configure_nested_identity_context();
@@ -1036,6 +1065,16 @@ TEST_BENCH(smmu500_test_bench, Stage1SixtyFourKGranuleTranslates)
 
     ASSERT_EQ(tbu_write32(0x1234, 0x64646464), tlm::TLM_OK_RESPONSE);
     ASSERT_EQ(read_memory32(0x201234), 0x64646464u);
+}
+
+TEST_BENCH(smmu500_test_bench, TBUDMIUsesSixtyFourKGranuleRange)
+{
+    configure_large_granule_page_table(1, 0x200000);
+
+    tlm::tlm_dmi dmi;
+    ASSERT_TRUE(tbu_get_dmi(0x1234, dmi));
+    ASSERT_EQ(dmi.get_start_address(), 0u);
+    ASSERT_EQ(dmi.get_end_address(), 0xffffu);
 }
 
 TEST_BENCH(smmu500_test_bench, Stage1BlockDescriptorTranslates)
@@ -1284,6 +1323,26 @@ TEST_BENCH(smmu500_test_bench, TBUDMIAllowsSecurityAnnotatedTransportWithEquival
 
     ASSERT_EQ(txn.get_response_status(), tlm::TLM_OK_RESPONSE);
     ASSERT_TRUE(txn.is_dmi_allowed());
+}
+
+TEST_BENCH(smmu500_test_bench, NativeTBUTransportDoesNotCreateQemuMrHint)
+{
+    configure_page_table(0x8000);
+
+    uint32_t value = 0;
+    tlm::tlm_generic_payload txn;
+    txn.set_command(tlm::TLM_READ_COMMAND);
+    txn.set_address(0x1234);
+    txn.set_data_ptr(reinterpret_cast<unsigned char*>(&value));
+    txn.set_data_length(sizeof(value));
+    txn.set_streaming_width(sizeof(value));
+    txn.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+
+    sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
+    tbu_initiator->b_transport(txn, delay);
+
+    ASSERT_EQ(txn.get_response_status(), tlm::TLM_OK_RESPONSE);
+    ASSERT_EQ(txn.get_extension<QemuMrHintTlmExtension>(), nullptr);
 }
 
 TEST_BENCH(smmu500_test_bench, TBUDMIPreservesSecurityAnnotatedTransportWhenControlsDiffer)

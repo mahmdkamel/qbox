@@ -600,3 +600,97 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 See [LICENSE](LICENSE).
+
+## HVF RAM Mapping Fix: Investigation and Removed Implementation
+
+Status: the HVF-specific CPU-to-global RAM discovery fix described here has
+been removed from QBox at the user's request. This document preserves its
+purpose and behavior for further investigation. No commit was made.
+
+### Observed Problem
+
+With ACCEL=hvf, QNX FastRPC could stop while initializing its buffer. The log
+showed ARM CPU-local RAM aliases for 0xa00000000-0xa7fffffff, without a matching
+global-initiator alias. HVF's memory listener observes address_space_memory,
+whereas its ARM data-abort handler resolves accesses through the CPU address
+space. CPU-local RAM resolution therefore does not establish that HVF has
+mapped the same guest-physical range.
+
+In the unpatched QEMU handler, a write fault resolving to RAM retries even
+when dirty logging is disabled. Without a hardware mapping, that can repeat
+without making progress. The user's QEMU patch moves the retry inside the
+dirty-log condition, allowing other faults to reach software emulation.
+That patch was not applied by this QBox work. The loaded binary and local
+QEMU source can differ; source inspection alone does not identify the binary.
+
+### Removed QBox Fix
+
+After installing a new ordinary CPU-local DMI RAM alias under HVF, the
+initiator requested discovery of the same guest-physical address through the
+global initiator. A callback stored in QemuInstance connected the two sockets.
+
+The global initiator created its own payload using its normal attributes and
+routing. It accepted the resulting DMI only when:
+
+- The probe completed and returned read/write RAM DMI with a host pointer.
+- No MemoryRegion mapping response replaced the ordinary RAM result.
+- The CPU-side DMI was also read/write and had a host pointer.
+- The global range contained the requested address and was contained within
+  the CPU-side range. The global range did not have to cover the entire CPU range.
+- Host pointers matched at corresponding guest addresses.
+- The guest range and host pointer were aligned to the macOS host page size.
+
+The accepted global RAM alias used the global initiator's existing alias
+bookkeeping and downstream DMI invalidation path. Installing it changed the
+global FlatView, allowing HVF's existing listener to call hv_vm_map(). The
+global socket did not recursively request another global mapping.
+
+The DMI probe ran on SystemC without the BQL. Alias installation ran under
+the BQL. The local alias's RCU read-lock scope ended before global discovery.
+The global callback was detached when its owning socket was destroyed.
+
+Removed code:
+
+- qemu-instance.h: m_hvf_global_ram_mapper, its setter and dispatch method,
+  and the functional include added for that callback.
+- ports/initiator.h: matches_hvf_ram(), the expected_ram probe argument and
+  validation, the CPU-side dispatch, global callback registration and cleanup,
+  and the Apple page-size include.
+
+### Results and Limits
+
+The user confirmed that the experiment made the QNX HVF test pass. Subsequent
+logs showed matching CPU/global aliases and successful tests on both DSP
+domains. Intermittent initialization failures were still reported, often
+disappearing with log_level=5. The supplied detailed logs contained successful
+runs, so they did not establish the cause of the intermittent failure.
+
+The workaround did not establish general compatibility between CPU-specific
+and global routes, nor did it replace QEMU's fault-handler correction for
+RAM that cannot be hardware-mapped. Removing it can restore the original
+HVF buffer-initialization problem with the unpatched QEMU binary.
+
+The Red Hat HVF log showed a separate direct-EL1 boot path, SCM service
+failures, secondary CPU startup failures, and rpcmem_alloc failure. Those
+observations did not prove an SMMU translation failure.
+
+### Region-Add Callback Proposal
+
+Adding set_region_add_callback() beside set_map_callback() in init_global()
+was discussed but not implemented. A global region-add listener observes
+global FlatView changes; CPU-local alias installation does not directly
+notify it. Initial listener registration could trigger eager global discovery,
+but that differs from the removed demand-driven bridge and requires checking
+topology callback reentrancy. No QEMU callback support was added here.
+
+### Retained Work
+
+The removal preserves the SMMU refactor, lazy translation windows, RAM bypass
+refills, backing-alias preservation across TLBI, caller-owned MR hints, and
+the boolean check_qemu_mr_hint() flow. It also preserves pending-refill
+cancellation on TLBI, which addresses a separate invalidation race without
+generation counters. That race fix is not proven to explain the intermittent
+HVF failures. Existing regression test additions remain.
+
+Verification for this removal: git diff --check and source searches only.
+No builds, tests, VP runs, QEMU edits, or cpu.h edits were performed.

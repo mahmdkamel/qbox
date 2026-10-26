@@ -17,8 +17,13 @@
 #include <ports/target-signal-socket.h>
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/simple_target_socket.h>
-#include <tlm-extensions/underlying-dmi.h>
 #include <tlm-extensions/qemu-memtx-attrs.h>
+#ifndef WITHOUT_QEMU
+#include <libqemu-cxx/libqemu-cxx.h>
+#include <ports/initiator.h>
+#include <runonsysc.h>
+#include <tlm-extensions/qemu-mr-hint.h>
+#endif
 
 #include <cassert>
 #include <algorithm>
@@ -28,6 +33,8 @@
 #include <cstring>
 #include <vector>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <sstream>
 
 #include "smmu500_gen.h"
@@ -1065,7 +1072,7 @@ private:
             have_descriptor = true;
 
             if (req->trace_id != 0) {
-                SCP_INFO(()) << std::hex << "SMMU PTW id " << req->trace_id << " SID 0x" << req->sid
+                SCP_TRACE(()) << std::hex << "SMMU PTW id " << req->trace_id << " SID 0x" << req->sid
                              << " CB" << cb << " VA 0x" << req->va << " L" << level
                              << " table 0x" << ttbr << " index 0x" << index << " descaddr 0x" << descaddr
                              << " desc 0x" << desc;
@@ -1182,15 +1189,18 @@ private:
         return;
 
     do_fault:
+        req->err = true;
         if (req->walk_fault && have_descriptor) {
             SCP_WARN(()) << "SMMU failed descriptor: CB " << std::dec << cb << " address 0x" << std::hex
-                         << last_descaddr << " value 0x" << last_desc;
+                         << last_descaddr << " value 0x" << last_desc << " stage " << std::dec << req->stage
+                         << " level " << level << " input 0x" << std::hex << req->va << " SID 0x" << req->sid
+                         << " S1CB " << std::dec << req->s1_cb << " table-walk " << req->internal_walk
+                         << " TCR 0x" << std::hex << req->tcr[stage] << " TTBR 0x" << req->ttbr[stage][0];
         }
         SCP_INFO(()) << "smmu fault id " << req->trace_id << " SID 0x" << std::hex << req->sid << " CB" << cb;
         dump_trans_req(*req);
         dump_cb_state(cb);
         dump_state();
-        req->err = true;
         if (!req->internal_walk && !req->suppress_fault) {
             const unsigned int fault_cb = (req->nested && req->stage == 2) ? req->s1_cb : cb;
             smmu500_fault(fault_cb, req, level);
@@ -1539,10 +1549,13 @@ public:
 template <unsigned int BUSWIDTH>
 class smmu500_tbu : public sc_core::sc_module
 {
+    // Transport addresses use bits [35:32] for the CSID carrier. Bypass DMI
+    // must stay within the 32-bit VA portion; translated IOMMU ranges retain
+    // their actual reported start and size.
     static constexpr unsigned int TRANSPORT_IOVA_WIDTH = 32;
-
     SCP_LOGGER();
     smmu500<BUSWIDTH>* m_smmu;
+    cci::cci_broker_handle m_broker;
 
     std::pair<uint64_t, uint64_t> dmi_range[SMMU_MAX_CB] = {};
     bool dmi_range_valid[SMMU_MAX_CB] = { false };
@@ -1555,6 +1568,245 @@ class smmu500_tbu : public sc_core::sc_module
         uint64_t page_end;
         uint64_t page_size;
     };
+
+#ifndef WITHOUT_QEMU
+    gs::runonsysc m_qemu_on_sysc;
+
+    struct QemuIommuRegion {
+        const uint64_t start;
+        const uint64_t size;
+        QemuInstanceDmiManager::QemuContainer owner;
+        std::shared_ptr<qemu::IOMMUMemoryRegion> mr;
+        QemuInstanceDmiManager* dmi_manager = nullptr;
+        std::mutex tlb_mutex;
+        uint64_t invalidation_count = 0;
+        std::array<std::map<uint64_t, qemu::IOMMUMemoryRegion::IOMMUTLBEntry>, 2> tlb;
+
+        QemuIommuRegion(uint64_t region_start, uint64_t region_size)
+            : start(region_start), size(region_size)
+        {
+        }
+    };
+
+    std::unique_ptr<QemuIommuRegion> m_qemu_iommu_region;
+
+    qemu::MemoryRegionOps::MemTxResult smmu500_qemu_io_access(
+        tlm::tlm_command command, uint64_t addr, uint64_t* data, unsigned int size,
+        qemu::MemoryRegionOps::MemTxAttrs attrs)
+    {
+        tlm::tlm_generic_payload txn;
+        txn.set_command(command);
+        txn.set_address(m_qemu_iommu_region->start + addr);
+        txn.set_data_ptr(reinterpret_cast<unsigned char*>(data));
+        txn.set_data_length(size);
+        txn.set_streaming_width(size);
+        QemuMemTxAttrExtensions attr_exts(txn, attrs);
+
+        auto& inst = m_qemu_iommu_region->mr->get_inst();
+        const bool locked = inst.is_iothread_locked();
+        if (locked) inst.unlock_iothread();
+        sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
+        const bool completed = m_qemu_on_sysc.run_on_sysc([&] {
+            if (attrs.debug) {
+                txn.set_response_status(transport_dbg(txn) == size ? tlm::TLM_OK_RESPONSE :
+                                                                    tlm::TLM_ADDRESS_ERROR_RESPONSE);
+            } else {
+                b_transport(txn, delay);
+            }
+        });
+        if (locked) inst.lock_iothread();
+        if (!completed) return qemu::MemoryRegionOps::MemTxError;
+        switch (txn.get_response_status()) {
+        case tlm::TLM_OK_RESPONSE:
+            return qemu::MemoryRegionOps::MemTxOK;
+        case tlm::TLM_ADDRESS_ERROR_RESPONSE:
+            return qemu::MemoryRegionOps::MemTxDecodeError;
+        default:
+            return qemu::MemoryRegionOps::MemTxError;
+        }
+    }
+
+    void smmu500_qemu_setup_region(QemuInstance& instance)
+    {
+        assert(m_qemu_on_sysc.is_on_sysc());
+        auto& region = *m_qemu_iommu_region;
+        assert(region.size != 0 && !region.mr);
+        auto& inst = instance.get();
+        region.dmi_manager = &instance.get_dmi_manager();
+
+        auto ops = inst.memory_region_ops_new();
+        ops->set_read_callback([this](uint64_t addr, uint64_t* data, unsigned int size,
+                                     qemu::MemoryRegionOps::MemTxAttrs attrs) {
+            return smmu500_qemu_io_access(tlm::TLM_READ_COMMAND, addr, data, size, attrs);
+        });
+        ops->set_write_callback([this](uint64_t addr, uint64_t data, unsigned int size,
+                                      qemu::MemoryRegionOps::MemTxAttrs attrs) {
+            return smmu500_qemu_io_access(tlm::TLM_WRITE_COMMAND, addr, &data, size, attrs);
+        });
+        ops->set_max_access_size(8);
+
+        region.owner = inst.template object_new_unparented<QemuInstanceDmiManager::QemuContainer>();
+        region.mr = std::make_shared<qemu::IOMMUMemoryRegion>(
+            inst.template object_new_unparented<qemu::IOMMUMemoryRegion>());
+        region.mr->init(region.owner, "smmu500-iommu", region.size, ops,
+                        [this](qemu::IOMMUMemoryRegion::IOMMUTLBEntry* te, uint64_t addr,
+                               qemu::IOMMUMemoryRegion::IOMMUAccessFlags flags, int idx) {
+                            smmu500_qemu_translate(*te, addr, flags, idx);
+                        },
+                        [](qemu::MemoryRegionOps::MemTxAttrs attrs) { return attrs.secure ? 1 : 0; },
+                        [] { return 2; },
+                        [](int idx) {
+                            qemu::MemoryRegionOps::MemTxAttrs attrs;
+                            attrs.secure = idx != 0;
+                            return attrs;
+                        });
+    }
+
+    void smmu500_qemu_translate(qemu::IOMMUMemoryRegion::IOMMUTLBEntry& entry, uint64_t addr,
+                               qemu::IOMMUMemoryRegion::IOMMUAccessFlags flags, int idx)
+    {
+        auto& region = *m_qemu_iommu_region;
+        auto& inst = region.mr->get_inst();
+        // This 4 KB IO fallback window is not the SMMU translation granule;
+        // direct mappings below use the register/descriptor-derived te.addr_mask.
+        entry = { .target_as = region.mr->m_as_io->get_ptr(),
+                  .iova = addr & ~SMMU_PAGEMASK,
+                  .translated_addr = addr & ~SMMU_PAGEMASK,
+                  .addr_mask = SMMU_PAGEMASK,
+                  .perm = qemu::IOMMUMemoryRegion::IOMMU_RW };
+        if (addr >= region.size) {
+            entry.perm = qemu::IOMMUMemoryRegion::IOMMU_NONE;
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(region.tlb_mutex);
+        auto& cache = region.tlb.at(idx);
+        auto it = cache.upper_bound(addr);
+        if (it != cache.begin()) {
+            --it;
+            if ((addr & ~it->second.addr_mask) == it->first) {
+                entry = it->second;
+                return;
+            }
+        }
+        const auto invalidation_count = region.invalidation_count;
+        lock.unlock();
+
+        const bool locked = inst.is_iothread_locked();
+        if (locked) inst.unlock_iothread();
+        auto translated = entry;
+        const bool completed = m_qemu_on_sysc.run_on_sysc([&] {
+            tlm::tlm_generic_payload txn;
+            const uint64_t iova = region.start + addr;
+            txn.set_address(iova);
+            txn.set_command(flags == qemu::IOMMUMemoryRegion::IOMMU_NONE ? tlm::TLM_IGNORE_COMMAND :
+                (flags & qemu::IOMMUMemoryRegion::IOMMU_WO) ? tlm::TLM_WRITE_COMMAND : tlm::TLM_READ_COMMAND);
+            QemuMemTxAttrExtensions attrs(txn, region.mr->attrs_for_index(idx));
+            auto te = m_smmu->smmu500_translate(txn, p_topology_id, true, false);
+            // Faults and permission checks must reach b_transport with the actual access type.
+            if (te.perm != smmu500<BUSWIDTH>::IOMMU_RW) return;
+            const uint64_t pa = (te.translated_addr & ~te.addr_mask) | (iova & te.addr_mask);
+            txn.set_address(pa);
+            tlm::tlm_dmi dmi;
+            if (!downstream_socket->get_direct_mem_ptr(txn, dmi) || !dmi.get_dmi_ptr() ||
+                pa < dmi.get_start_address() || pa > dmi.get_end_address() ||
+                dmi.get_start_address() >= dmi.get_end_address() ||
+                !dmi.is_read_write_allowed()) return;
+
+            const uintptr_t host = reinterpret_cast<uintptr_t>(dmi.get_dmi_ptr());
+            const uint64_t size = dmi.get_end_address() - dmi.get_start_address() + 1;
+            if (!size || size - 1 > UINTPTR_MAX - host) return;
+            const uint64_t ram_addr = host + (pa - dmi.get_start_address());
+            // Keep bypass mappings within one CSID and all mappings inside the DMI grant and aperture.
+            uint64_t mask = te.addr_mask & UINT32_MAX;
+            while ((addr & mask) != (iova & mask) ||
+                   (addr & mask) != (ram_addr & mask) || (ram_addr & ~mask) < host ||
+                   (ram_addr | mask) > host + size - 1 || (addr | mask) >= region.size) mask >>= 1;
+
+            const bool mapping_locked = inst.is_iothread_locked();
+            if (!mapping_locked) inst.lock_iothread();
+            qemu::RcuReadLock rcu_read_lock = inst.rcu_read_lock_new();
+            region.dmi_manager->get_region(dmi);
+            translated.target_as = region.dmi_manager->get_address_space().get_ptr();
+            translated.iova = addr & ~mask;
+            translated.translated_addr = ram_addr & ~mask;
+            translated.addr_mask = mask;
+            if (!mapping_locked) inst.unlock_iothread();
+        });
+        if (locked) inst.lock_iothread();
+
+        lock.lock();
+        // Invalidation while the job ran makes its result stale.
+        if (!completed || invalidation_count != region.invalidation_count) return;
+        entry = translated;
+        if (entry.target_as != region.mr->m_as_io->get_ptr()) cache[entry.iova] = entry;
+    }
+
+    void smmu500_qemu_replace_mr_hint_with_iommu_region(tlm::tlm_generic_payload& txn)
+    {
+        const uint64_t iova = txn.get_address();
+        const auto* origin = txn.get_extension<QemuInstanceHintTlmExtension>();
+        if (!origin) return;
+        auto* hint = txn.get_extension<QemuMrHintTlmExtension>();
+        if (hint) txn.clear_extension(hint);
+
+        assert(m_qemu_on_sysc.is_on_sysc());
+        if (!m_qemu_iommu_region) {
+            SCP_WARN(()) << "Cannot replace QEMU MR hint: upstream socket size is zero";
+            return;
+        }
+        auto& region = *m_qemu_iommu_region;
+        if (iova < region.start || iova - region.start >= region.size) {
+            SCP_WARN(()) << "Cannot replace QEMU MR hint for IOVA 0x" << std::hex << iova
+                          << ": it is outside upstream socket [0x" << region.start << ", 0x"
+                          << region.start + region.size - 1 << "]";
+            return;
+        }
+
+        auto& inst = origin->instance->get();
+        if (!region.mr) {
+            const bool locked = inst.is_iothread_locked();
+            if (!locked) inst.lock_iothread();
+            smmu500_qemu_setup_region(*origin->instance);
+            if (!locked) inst.unlock_iothread();
+        }
+        if (&region.mr->get_inst() != &inst) {
+            SCP_WARN(()) << "Cannot replace QEMU MR hint from a different QEMU instance";
+            return;
+        }
+
+        const QemuMrHintTlmExtension iommu_hint(*region.mr, iova - region.start);
+        if (hint) hint->copy_from(iommu_hint);
+        else hint = new QemuMrHintTlmExtension(iommu_hint);
+        txn.set_extension(hint);
+    }
+
+    void smmu500_qemu_invalidate()
+    {
+        assert(m_qemu_on_sysc.is_on_sysc());
+        if (!m_qemu_iommu_region || !m_qemu_iommu_region->mr) return;
+
+        auto& region = *m_qemu_iommu_region;
+        auto& inst = region.mr->get_inst();
+        const bool iothread_locked = inst.is_iothread_locked();
+        if (!iothread_locked) inst.lock_iothread();
+        {
+            std::lock_guard<std::mutex> lock(region.tlb_mutex);
+            ++region.invalidation_count;
+            for (auto& cache : region.tlb) cache.clear();
+        }
+        qemu::IOMMUMemoryRegion::IOMMUTLBEntry flush = {
+            .target_as = region.mr->m_as_io->get_ptr(),
+            .iova = 0,
+            .translated_addr = 0,
+            .addr_mask = UINT64_MAX,
+            .perm = qemu::IOMMUMemoryRegion::IOMMU_NONE,
+        };
+        region.mr->iommu_unmap(&flush);
+        if (!iothread_locked) inst.unlock_iothread();
+    }
+
+#endif
 
 protected:
     void b_transport(tlm::tlm_generic_payload& txn, sc_core::sc_time& delay)
@@ -1581,6 +1833,9 @@ protected:
             txn.set_address((te.translated_addr & ~te.addr_mask) | (addr & te.addr_mask));
             downstream_socket->b_transport(txn, delay);
             txn.set_address(addr);
+#ifndef WITHOUT_QEMU
+            smmu500_qemu_replace_mr_hint_with_iommu_region(txn);
+#endif
         }
     }
 
@@ -1600,6 +1855,21 @@ protected:
 
     virtual bool get_direct_mem_ptr(tlm::tlm_generic_payload& txn, tlm::tlm_dmi& dmi_data)
     {
+#ifndef WITHOUT_QEMU
+        // QEMU traffic uses the IOMMU MR installed by b_transport, not an upstream DMI alias.
+        if (txn.get_extension<QemuInstanceHintTlmExtension>()) {
+            const uint64_t addr = txn.get_address();
+            if (m_qemu_iommu_region && addr >= m_qemu_iommu_region->start &&
+                addr - m_qemu_iommu_region->start < m_qemu_iommu_region->size) {
+                dmi_data.set_start_address(m_qemu_iommu_region->start);
+                dmi_data.set_end_address(m_qemu_iommu_region->start + m_qemu_iommu_region->size - 1);
+            } else {
+                dmi_data.set_start_address(addr & ~SMMU_PAGEMASK);
+                dmi_data.set_end_address(addr | SMMU_PAGEMASK);
+            }
+            return false;
+        }
+#endif
         MemoryView VIRT;
         MemoryView PHYS;
 
@@ -1682,13 +1952,6 @@ protected:
             return false;
         }
 
-        gs::UnderlyingDMITlmExtension* u_dmi;
-        txn.get_extension(u_dmi);
-        if (u_dmi) {
-            tlm::tlm_dmi udmi = dmi_data;
-            u_dmi->add_dmi(this, udmi, gs::tlm_dmi_ex::dmi_iommu);
-        }
-
         uint64_t dmi_offset = PHYS.page_start - dmi_data.get_start_address();
         assert(dmi_data.get_start_address() <= PHYS.page_start);
         assert(PHYS.page_end <= dmi_data.get_end_address());
@@ -1716,6 +1979,7 @@ protected:
 
         int CB = -1;
         const bool address_carries_csid = (VIRT.address >> 36) == 0;
+        txn.set_address(VIRT.address);
         m_smmu->smmu500_resolve_stream_id(p_topology_id, VIRT.address, &CB, nullptr, nullptr,
                                            address_carries_csid);
         if (CB < 0) {
@@ -1734,10 +1998,10 @@ protected:
 
         if (PHYS.page_start != VIRT.page_start) {
             uint64_t bits_masked = VIRT.address - (VIRT.address & ~SMMU_PAGEMASK);
-            SCP_DEBUG(()) << std::hex << "\nVIRT   Page Start 0x" << VIRT.page_start << "\nPHYS   Page Start 0x"
+            SCP_TRACE(()) << std::hex << "\nVIRT   Page Start 0x" << VIRT.page_start << "\nPHYS   Page Start 0x"
                          << PHYS.page_start << "\nbits_masked         0x" << bits_masked;
         }
-        SCP_DEBUG(()) << std::hex << "smmu TBU DMI: translate 0x" << VIRT.address << " to 0x" << te.translated_addr
+        SCP_TRACE(()) << std::hex << "smmu TBU DMI: translate 0x" << VIRT.address << " to 0x" << te.translated_addr
                      << " pg size 0x" << PHYS.page_size << " pg base 0x" << PHYS.page_start << " offset 0x"
                      << dmi_offset << " start 0x" << dmi_data.get_start_address() << " end 0x"
                      << dmi_data.get_end_address();
@@ -1758,7 +2022,11 @@ public:
     }
 
     smmu500_tbu(sc_core::sc_module_name name, smmu500<BUSWIDTH>* _smmu)
-        : p_topology_id("topology_id", 0x0, "Topology ID for this TBU")
+        : m_broker(cci::cci_get_broker())
+#ifndef WITHOUT_QEMU
+        , m_qemu_on_sysc(sc_core::sc_gen_unique_name("smmu500_qemu_on_sysc"))
+#endif
+        , p_topology_id("topology_id", 0x0, "Topology ID for this TBU")
         , upstream_socket("upstream_socket")
         , downstream_socket("downstream_socket")
     {
@@ -1767,9 +2035,74 @@ public:
         upstream_socket.register_b_transport(this, &smmu500_tbu::b_transport);
         upstream_socket.register_transport_dbg(this, &smmu500_tbu::transport_dbg);
         upstream_socket.register_get_direct_mem_ptr(this, &smmu500_tbu::get_direct_mem_ptr);
+        downstream_socket.register_invalidate_direct_mem_ptr(this, &smmu500_tbu::invalidate_direct_mem_ptr);
+    }
+
+#ifndef WITHOUT_QEMU
+    void end_of_elaboration() override
+    {
+        const std::string socket_name = std::string(sc_core::sc_module::name()) + ".upstream_socket";
+        uint64_t region_start = gs::cci_get_d<uint64_t>(m_broker, socket_name + ".address", 0);
+        if (gs::cci_get_d<bool>(m_broker, socket_name + ".relative_addresses", true)) region_start = 0;
+        uint64_t region_size = 0;
+        const bool has_size = gs::cci_get(m_broker, socket_name + ".size", region_size);
+
+        const sc_core::sc_object* socket = &upstream_socket;
+        std::vector<const sc_core::sc_object*> visited;
+        while (!has_size && socket) {
+            if (std::find(visited.begin(), visited.end(), socket) != visited.end()) break;
+            visited.push_back(socket);
+            const auto* module = socket->get_parent_object();
+            const std::string bind = gs::cci_get_d<std::string>(m_broker, std::string(socket->name()) + ".bind", "");
+            if (bind.empty()) break;
+            const std::string path = bind.front() == '&' ? bind.substr(1) : bind;
+            socket = sc_core::sc_find_object(path.c_str());
+            for (auto* scope = module ? module->get_parent_object() : nullptr; !socket && scope;
+                 scope = scope->get_parent_object()) {
+                socket = sc_core::sc_find_object((std::string(scope->name()) + "." + path).c_str());
+            }
+            if (!socket) break;
+            using TargetSocket = tlm::tlm_base_target_socket_b<BUSWIDTH, tlm::tlm_fw_transport_if<>,
+                                                             tlm::tlm_bw_transport_if<>>;
+            if (!dynamic_cast<const TargetSocket*>(socket) &&
+                gs::cci_get_d<std::string>(m_broker, std::string(socket->name()) + ".bind", "").empty()) {
+                const auto* parent = socket->get_parent_object();
+                socket = parent ? sc_core::sc_find_object((std::string(parent->name()) + ".target_socket").c_str())
+                                : nullptr;
+            }
+            if (dynamic_cast<const TargetSocket*>(socket) &&
+                gs::cci_get(m_broker, std::string(socket->name()) + ".size", region_size)) {
+                region_start = gs::cci_get_d<uint64_t>(m_broker, std::string(socket->name()) + ".address", 0);
+                if (gs::cci_get_d<bool>(m_broker, std::string(socket->name()) + ".relative_addresses", true)) {
+                    region_start = 0;
+                }
+                region_start = gs::cci_get_d<uint64_t>(
+                    m_broker, std::string(socket->get_parent_object()->name()) + ".mapped_base_addr", region_start);
+                break;
+            }
+        }
+        if (region_size != 0) {
+            m_qemu_iommu_region = std::make_unique<QemuIommuRegion>(region_start, region_size);
+        }
+    }
+#endif
+
+    void invalidate_direct_mem_ptr(sc_dt::uint64, sc_dt::uint64)
+    {
+        reset_dmi();
     }
 
     void invalidate(uint32_t CB)
+    {
+        if (CB >= SMMU_MAX_CB) return;
+#ifndef WITHOUT_QEMU
+        smmu500_qemu_invalidate();
+#endif
+        invalidate_dmi_range(CB);
+    }
+
+
+    void invalidate_dmi_range(uint32_t CB)
     {
         if (CB >= SMMU_MAX_CB) return;
         if (!dmi_range_valid[CB]) return;
@@ -1780,7 +2113,10 @@ public:
 
     void reset_dmi()
     {
-        for (unsigned int cb = 0; cb < SMMU_MAX_CB; ++cb) invalidate(cb);
+#ifndef WITHOUT_QEMU
+        smmu500_qemu_invalidate();
+#endif
+        for (unsigned int cb = 0; cb < SMMU_MAX_CB; ++cb) invalidate_dmi_range(cb);
         if (bypass_dmi_range_valid) {
             upstream_socket->invalidate_direct_mem_ptr(bypass_dmi_range.first, bypass_dmi_range.second);
             bypass_dmi_range_valid = false;
